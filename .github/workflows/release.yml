@@ -4,10 +4,10 @@ on:
   schedule:
     # 每周一 UTC 3:00 执行 (北京时间周一 11:00)
     - cron: '0 3 * * 1'
-  workflow_dispatch: # 支持手动触发
+  workflow_dispatch:
 
 jobs:
-  # 第一个 Job：检查最新版本是否已经发布过
+  # Job 1: 检查最新版本是否已存在
   check-version:
     name: 检查最新版本
     runs-on: ubuntu-latest
@@ -18,12 +18,11 @@ jobs:
       - name: 检出仓库
         uses: actions/checkout@v7
         with:
-          fetch-depth: 0 # 获取完整历史用于检查 tag
+          fetch-depth: 0
 
       - name: 检查是否已构建
         id: check
         run: |
-          # 从 BusyBox 官方仓库获取最新稳定版标签 (例如 1_36_1)
           LATEST_VERSION=$(git ls-remote --tags https://git.busybox.net/busybox | \
             grep -o 'refs/tags/[0-9]*_[0-9]*_[0-9]*' | \
             sort -V | tail -1 | sed 's/refs\/tags\///')
@@ -31,7 +30,6 @@ jobs:
           echo "最新版本: $LATEST_VERSION"
           echo "latest-version=$LATEST_VERSION" >> $GITHUB_OUTPUT
           
-          # 检查当前仓库是否已经存在对应的 Release Tag
           if git tag --list | grep -q "busybox-$LATEST_VERSION"; then
             echo "版本 $LATEST_VERSION 已存在，跳过构建"
             echo "skip=true" >> $GITHUB_OUTPUT
@@ -40,7 +38,7 @@ jobs:
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
-  # 第二个 Job：矩阵并行构建
+  # Job 2: 矩阵并行构建
   build:
     name: 编译 ${{ matrix.arch }}
     needs: check-version
@@ -48,41 +46,44 @@ jobs:
     runs-on: ubuntu-latest
     
     strategy:
-      fail-fast: false # 某个架构失败不影响其他架构继续编译
+      fail-fast: false
       matrix:
         include:
-          # 主流架构：使用 NDK r29
           - arch: arm
             ndk-version: r29
             cross_compile: "arm-linux-androideabi-"
+            clang_target: "armv7a-linux-androideabi21-clang"
             make_arch: arm
           - arch: arm64
             ndk-version: r29
             cross_compile: "aarch64-linux-android-"
+            clang_target: "aarch64-linux-android21-clang"
             make_arch: arm64
           - arch: x86
             ndk-version: r29
             cross_compile: "i686-linux-android-"
+            clang_target: "i686-linux-android21-clang"
             make_arch: x86
           - arch: x86_64
             ndk-version: r29
             cross_compile: "x86_64-linux-android-"
+            clang_target: "x86_64-linux-android21-clang"
             make_arch: x86_64
-          # MIPS 架构：使用旧版 NDK r23c (NDK r24+ 已彻底移除 MIPS 支持)
           - arch: mips
             ndk-version: r23c
             cross_compile: "mipsel-linux-android-"
+            clang_target: "mipsel-linux-android21-clang"
             make_arch: mips
           - arch: mips64
             ndk-version: r23c
             cross_compile: "mips64el-linux-android-"
+            clang_target: "mips64el-linux-android21-clang"
             make_arch: mips
 
     steps:
       - name: 检出仓库
         uses: actions/checkout@v7
 
-      # 使用 setup-ndk 自带的缓存功能，无需单独引入 actions/cache
       - name: 设置 NDK ${{ matrix.ndk-version }}
         id: setup-ndk
         uses: nttld/setup-ndk@v1
@@ -112,6 +113,32 @@ jobs:
             [ -e "$patch" ] && patch -p1 < "$patch" || true
           done
 
+      - name: 创建 GCC/strip 符号链接 (NDK r22+ 移除了 GCC，需链接到 Clang)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          
+          # NDK r22+ 移除了独立的 GCC 工具链，只保留 LLVM/Clang
+          # BusyBox Makefile 仍按传统方式调用 ${CROSS_COMPILE}gcc
+          # 创建符号链接让 gcc 实际指向 clang
+          ln -sf "${{ matrix.clang_target }}" "$NDK_BIN/${{ matrix.cross_compile }}gcc"
+          ln -sf "${{ matrix.clang_target }}" "$NDK_BIN/${{ matrix.cross_compile }}cc"
+          ln -sf llvm-strip "$NDK_BIN/${{ matrix.cross_compile }}strip"
+          ln -sf llvm-ar "$NDK_BIN/${{ matrix.cross_compile }}ar"
+          ln -sf llvm-as "$NDK_BIN/${{ matrix.cross_compile }}as"
+          ln -sf llvm-nm "$NDK_BIN/${{ matrix.cross_compile }}nm"
+          ln -sf llvm-objcopy "$NDK_BIN/${{ matrix.cross_compile }}objcopy"
+          ln -sf llvm-objdump "$NDK_BIN/${{ matrix.cross_compile }}objdump"
+          ln -sf llvm-ranlib "$NDK_BIN/${{ matrix.cross_compile }}ranlib"
+          ln -sf llvm-readelf "$NDK_BIN/${{ matrix.cross_compile }}readelf"
+          
+          # 验证符号链接是否工作
+          echo "验证 gcc 符号链接:"
+          "$NDK_BIN/${{ matrix.cross_compile }}gcc" --version
+          echo "验证 strip 符号链接:"
+          "$NDK_BIN/${{ matrix.cross_compile }}strip" --version
+
       - name: 配置与编译
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -122,9 +149,9 @@ jobs:
           # 生成默认配置
           make ARCH=${{ matrix.make_arch }} CROSS_COMPILE=${{ matrix.cross_compile }} defconfig
           
-          # 开启静态编译
+          # 开启静态编译，确保二进制文件在 Android 上独立运行无依赖
           sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
-          # 关闭 Android 不兼容的特性
+          # 关闭在 Android 上不兼容的特性
           sed -i 's/CONFIG_FEATURE_WTMP=y/# CONFIG_FEATURE_WTMP is not set/' .config
           sed -i 's/CONFIG_FEATURE_UTMP=y/# CONFIG_FEATURE_UTMP is not set/' .config
           
@@ -143,7 +170,7 @@ jobs:
           if-no-files-found: error
           compression-level: 9
 
-  # 第三个 Job：汇总并发布 Release
+  # Job 3: 汇总并发布 Release
   release:
     name: 汇总并发布
     needs: build
@@ -156,7 +183,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: artifacts
-          merge-multiple: true # 直接合并到同一目录
+          merge-multiple: true
 
       - name: 打包发布文件
         run: |
