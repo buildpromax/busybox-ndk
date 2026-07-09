@@ -23,9 +23,18 @@ jobs:
       - name: 检查是否已构建
         id: check
         run: |
+          # 优先从官方源获取最新版本
           LATEST_VERSION=$(git ls-remote --tags https://git.busybox.net/busybox | \
             grep -o 'refs/tags/[0-9]*_[0-9]*_[0-9]*' | \
             sort -V | tail -1 | sed 's/refs\/tags\///')
+          
+          # 如果官方源失败，尝试GitHub镜像
+          if [ -z "$LATEST_VERSION" ]; then
+            echo "官方源不可用，尝试GitHub镜像..."
+            LATEST_VERSION=$(git ls-remote --tags https://github.com/vda-linux/busybox_mirror | \
+              grep -o 'refs/tags/[0-9]*_[0-9]*_[0-9]*' | \
+              sort -V | tail -1 | sed 's/refs\/tags\///')
+          fi
           
           echo "最新版本: $LATEST_VERSION"
           echo "latest-version=$LATEST_VERSION" >> $GITHUB_OUTPUT
@@ -99,9 +108,20 @@ jobs:
 
       - name: 下载 BusyBox 源码
         run: |
+          # 优先从官方源下载
           git clone git://busybox.net/busybox.git
           cd busybox
           git checkout ${{ needs.check-version.outputs.latest-version }}
+          
+          # 如果官方源失败，尝试GitHub镜像
+          if [ $? -ne 0 ]; then
+            echo "官方源不可用，尝试GitHub镜像..."
+            cd ..
+            rm -rf busybox
+            git clone https://github.com/vda-linux/busybox_mirror.git busybox
+            cd busybox
+            git checkout ${{ needs.check-version.outputs.latest-version }}
+          fi
 
       - name: 应用 Android NDK 兼容补丁
         run: |
@@ -113,30 +133,43 @@ jobs:
             [ -e "$patch" ] && patch -p1 < "$patch" || true
           done
 
-      - name: 创建 GCC/strip 符号链接 (NDK r22+ 移除了 GCC，需链接到 Clang)
+      - name: 创建 GCC/strip 符号链接
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           
-          # NDK r22+ 移除了独立的 GCC 工具链，只保留 LLVM/Clang
-          # BusyBox Makefile 仍按传统方式调用 ${CROSS_COMPILE}gcc
-          # 创建符号链接让 gcc 实际指向 clang
+          # 强制删除可能残留的旧包装器脚本或链接
+          rm -f "$NDK_BIN/${{ matrix.cross_compile }}gcc"
+          rm -f "$NDK_BIN/${{ matrix.cross_compile }}cc"
+          rm -f "$NDK_BIN/${{ matrix.cross_compile }}strip"
+          rm -f "$NDK_BIN/${{ matrix.cross_compile }}ar"
+          rm -f "$NDK_BIN/${{ matrix.cross_compile }}as"
+          rm -f "$NDK_BIN/${{ matrix.cross_compile }}nm"
+          rm -f "$NDK_BIN/${{ matrix.cross_compile }}objcopy"
+          rm -f "$NDK_BIN/${{ matrix.cross_compile }}objdump"
+          rm -f "$NDK_BIN/${{ matrix.cross_compile }}ranlib"
+          rm -f "$NDK_BIN/${{ matrix.cross_compile }}readelf"
+          
+          # 创建纯符号链接，直接指向带 API 级别的 clang
           ln -sf "${{ matrix.clang_target }}" "$NDK_BIN/${{ matrix.cross_compile }}gcc"
           ln -sf "${{ matrix.clang_target }}" "$NDK_BIN/${{ matrix.cross_compile }}cc"
-          ln -sf llvm-strip "$NDK_BIN/${{ matrix.cross_compile }}strip"
-          ln -sf llvm-ar "$NDK_BIN/${{ matrix.cross_compile }}ar"
-          ln -sf llvm-as "$NDK_BIN/${{ matrix.cross_compile }}as"
-          ln -sf llvm-nm "$NDK_BIN/${{ matrix.cross_compile }}nm"
-          ln -sf llvm-objcopy "$NDK_BIN/${{ matrix.cross_compile }}objcopy"
-          ln -sf llvm-objdump "$NDK_BIN/${{ matrix.cross_compile }}objdump"
-          ln -sf llvm-ranlib "$NDK_BIN/${{ matrix.cross_compile }}ranlib"
-          ln -sf llvm-readelf "$NDK_BIN/${{ matrix.cross_compile }}readelf"
+          ln -sf "llvm-strip" "$NDK_BIN/${{ matrix.cross_compile }}strip"
+          ln -sf "llvm-ar" "$NDK_BIN/${{ matrix.cross_compile }}ar"
+          ln -sf "llvm-as" "$NDK_BIN/${{ matrix.cross_compile }}as"
+          ln -sf "llvm-nm" "$NDK_BIN/${{ matrix.cross_compile }}nm"
+          ln -sf "llvm-objcopy" "$NDK_BIN/${{ matrix.cross_compile }}objcopy"
+          ln -sf "llvm-objdump" "$NDK_BIN/${{ matrix.cross_compile }}objdump"
+          ln -sf "llvm-ranlib" "$NDK_BIN/${{ matrix.cross_compile }}ranlib"
+          ln -sf "llvm-readelf" "$NDK_BIN/${{ matrix.cross_compile }}readelf"
           
           # 验证符号链接是否工作
           echo "验证 gcc 符号链接:"
+          ls -l "$NDK_BIN/${{ matrix.cross_compile }}gcc"
           "$NDK_BIN/${{ matrix.cross_compile }}gcc" --version
+          
           echo "验证 strip 符号链接:"
+          ls -l "$NDK_BIN/${{ matrix.cross_compile }}strip"
           "$NDK_BIN/${{ matrix.cross_compile }}strip" --version
 
       - name: 配置与编译
