@@ -2,10 +2,12 @@ name: 每周构建BusyBox NDK
 
 on:
   schedule:
+    # 每周一 UTC 3:00 执行 (北京时间周一 11:00)
     - cron: '0 3 * * 1'
-  workflow_dispatch:
+  workflow_dispatch: # 支持手动触发
 
 jobs:
+  # Job 1: 检查最新版本是否已存在
   check-version:
     name: 检查最新版本
     runs-on: ubuntu-latest
@@ -21,20 +23,30 @@ jobs:
       - name: 检查是否已构建
         id: check
         run: |
-          # 从官方下载页面获取最新版本
-          LATEST_VERSION=$(wget -qO- https://busybox.net/downloads/ | \
-            grep -o 'busybox-[0-9]\+\.[0-9]\+\.[0-9]\+\.tar\.bz2' | \
-            head -1 | sed 's/busybox-\([0-9.]*\)\.tar\.bz2/\1/')
+          # 方法1：从Git仓库获取最新标签
+          LATEST_VERSION=$(git ls-remote --tags https://git.busybox.net/busybox | \
+            grep -o 'refs/tags/[0-9]*_[0-9]*_[0-9]*' | \
+            sort -V | tail -1 | sed 's/refs\/tags\///')
+          
+          # 方法2：如果Git方法失败，从下载页面获取
+          if [ -z "$LATEST_VERSION" ]; then
+            LATEST_VERSION=$(wget -qO- https://busybox.net/downloads/ | \
+              grep -o 'busybox-[0-9]\+\.[0-9]\+\.[0-9]\+\.tar\.bz2' | \
+              sort -V | tail -1 | sed 's/busybox-\([0-9.]*\)\.tar\.bz2/\1/')
+          fi
           
           echo "最新版本: $LATEST_VERSION"
           echo "latest-version=$LATEST_VERSION" >> $GITHUB_OUTPUT
           
           if git tag --list | grep -q "busybox-$LATEST_VERSION"; then
+            echo "版本 $LATEST_VERSION 已存在，跳过构建"
             echo "skip=true" >> $GITHUB_OUTPUT
           else
+            echo "版本 $LATEST_VERSION 不存在，开始构建"
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
+  # Job 2: 矩阵并行构建
   build:
     name: 编译 ${{ matrix.arch }}
     needs: check-version
@@ -45,29 +57,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 主流架构：使用 NDK r29
           - arch: arm
             ndk-version: r29
-            clang_target: "armv7a-linux-androideabi21-clang"
+            cross_compile: "arm-linux-androideabi-"
             make_arch: arm
           - arch: arm64
             ndk-version: r29
-            clang_target: "aarch64-linux-android21-clang"
+            cross_compile: "aarch64-linux-android-"
             make_arch: arm64
           - arch: x86
             ndk-version: r29
-            clang_target: "i686-linux-android21-clang"
+            cross_compile: "i686-linux-android-"
             make_arch: x86
           - arch: x86_64
             ndk-version: r29
-            clang_target: "x86_64-linux-android21-clang"
+            cross_compile: "x86_64-linux-android-"
             make_arch: x86_64
+          # MIPS 架构：使用旧版 NDK r23c (NDK r24+ 已彻底移除 MIPS 支持)
           - arch: mips
             ndk-version: r23c
-            clang_target: "mipsel-linux-android21-clang"
+            cross_compile: "mipsel-linux-android-"
             make_arch: mips
           - arch: mips64
             ndk-version: r23c
-            clang_target: "mips64el-linux-android21-clang"
+            cross_compile: "mips64el-linux-android-"
             make_arch: mips
 
     steps:
@@ -89,22 +103,68 @@ jobs:
 
       - name: 下载 BusyBox 源码
         run: |
-          # 直接从官网下载源码包，避免Git克隆问题
+          # 直接从官网下载指定版本的源码包
           wget -qO busybox.tar.bz2 "https://busybox.net/downloads/busybox-${{ needs.check-version.outputs.latest-version }}.tar.bz2"
           tar -xjf busybox.tar.bz2
           mv busybox-${{ needs.check-version.outputs.latest-version }} busybox
+          
+          # 验证下载的文件完整性
+          echo "下载的文件信息:"
+          ls -la busybox.tar.bz2
+          file busybox.tar.bz2
+
+      - name: 设置NDK和Clang工具链
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          
+          # 查找实际的Clang可执行文件
+          CLANG_FILE=$(ls "$NDK_BIN" | grep -E '^clang-[0-9]+$' | head -1)
+          if [ -z "$CLANG_FILE" ]; then
+            # 如果没有找到clang-版本号格式的文件，尝试使用clang
+            if [ -f "$NDK_BIN/clang" ]; then
+              CLANG_FILE="clang"
+            else
+              echo "错误：找不到Clang可执行文件"
+              exit 1
+            fi
+          fi
+          
+          echo "找到Clang文件: $CLANG_FILE"
+          
+          # 为当前架构创建符号链接
+          ln -sf "$NDK_BIN/$CLANG_FILE" "$NDK_BIN/${{ matrix.cross_compile }}gcc"
+          ln -sf "$NDK_BIN/$CLANG_FILE" "$NDK_BIN/${{ matrix.cross_compile }}cc"
+          ln -sf "$NDK_BIN/llvm-strip" "$NDK_BIN/${{ matrix.cross_compile }}strip"
+          ln -sf "$NDK_BIN/llvm-ar" "$NDK_BIN/${{ matrix.cross_compile }}ar"
+          ln -sf "$NDK_BIN/llvm-as" "$NDK_BIN/${{ matrix.cross_compile }}as"
+          ln -sf "$NDK_BIN/llvm-nm" "$NDK_BIN/${{ matrix.cross_compile }}nm"
+          ln -sf "$NDK_BIN/llvm-objcopy" "$NDK_BIN/${{ matrix.cross_compile }}objcopy"
+          ln -sf "$NDK_BIN/llvm-objdump" "$NDK_BIN/${{ matrix.cross_compile }}objdump"
+          ln -sf "$NDK_BIN/llvm-ranlib" "$NDK_BIN/${{ matrix.cross_compile }}ranlib"
+          ln -sf "$NDK_BIN/llvm-readelf" "$NDK_BIN/${{ matrix.cross_compile }}readelf"
+          
+          # 验证符号链接
+          echo "验证符号链接:"
+          ls -l "$NDK_BIN/${{ matrix.cross_compile }}gcc"
+          ls -l "$NDK_BIN/${{ matrix.cross_compile }}strip"
+          
+          # 测试编译器
+          "$NDK_BIN/${{ matrix.cross_compile }}gcc" --version
+          "$NDK_BIN/${{ matrix.cross_compile }}strip" --version
 
       - name: 应用 Android NDK 兼容补丁
         run: |
           cd busybox
-          # 下载 osm0sis 的补丁
+          # 下载 osm0sis 的补丁，解决 BusyBox 与 Android Bionic libc 的兼容性问题
           wget -qO- https://github.com/osm0sis/android-busybox-ndk/archive/refs/heads/master.tar.gz | tar xz
           cp -r android-busybox-ndk-master/patches/* . 2>/dev/null || true
           for patch in patches/*.patch; do
             [ -e "$patch" ] && patch -p1 < "$patch" || true
           done
 
-      - name: 配置与编译 (直接使用Clang)
+      - name: 配置与编译
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
@@ -112,25 +172,20 @@ jobs:
           NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           export PATH="$NDK_BIN:$PATH"
           
-          # 直接使用NDK中的Clang编译器，不创建任何符号链接
-          make ARCH=${{ matrix.make_arch }} \
-               CC="$NDK_BIN/${{ matrix.clang_target }}" \
-               STRIP="$NDK_BIN/llvm-strip" \
-               defconfig
+          # 生成默认配置
+          make ARCH=${{ matrix.make_arch }} CROSS_COMPILE=${{ matrix.cross_compile }} defconfig
           
-          # 开启静态编译
+          # 开启静态编译，确保二进制文件在 Android 上独立运行无依赖
           sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+          # 关闭在 Android 上不兼容的特性
           sed -i 's/CONFIG_FEATURE_WTMP=y/# CONFIG_FEATURE_WTMP is not set/' .config
           sed -i 's/CONFIG_FEATURE_UTMP=y/# CONFIG_FEATURE_UTMP is not set/' .config
           
-          # 多线程编译
-          make ARCH=${{ matrix.make_arch }} \
-               CC="$NDK_BIN/${{ matrix.clang_target }}" \
-               STRIP="$NDK_BIN/llvm-strip" \
-               -j$(nproc)
+          # 多线程并行编译 (使用所有可用 CPU 核心)
+          make ARCH=${{ matrix.make_arch }} CROSS_COMPILE=${{ matrix.cross_compile }} -j$(nproc)
           
-          # 剥离调试信息
-          "$NDK_BIN/llvm-strip" busybox
+          # 剥离调试信息减小体积
+          ${{ matrix.cross_compile }}strip busybox
           mv busybox busybox-${{ matrix.arch }}
 
       - name: 上传构建产物
@@ -141,6 +196,7 @@ jobs:
           if-no-files-found: error
           compression-level: 9
 
+  # Job 3: 汇总并发布 Release
   release:
     name: 汇总并发布
     needs: build
