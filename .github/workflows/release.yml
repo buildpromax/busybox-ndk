@@ -1,10 +1,13 @@
-name: 每周构建BusyBox NDK
+name: 每周构建 BusyBox NDK
 
 on:
   schedule:
     # 每周一 UTC 3:00 执行 (北京时间周一 11:00)
     - cron: '0 3 * * 1'
   workflow_dispatch: # 支持手动触发
+
+permissions:
+  contents: write   # 创建 Release 必需,不加会 403
 
 jobs:
   # Job 1: 检查最新版本
@@ -24,27 +27,41 @@ jobs:
         id: check
         run: |
           # 优先从官方 Git 仓库获取最新标签 (格式为 1_37_0)
-          LATEST_VERSION=$(git ls-remote --tags https://git.busybox.net/busybox | \
-            grep -o 'refs/tags/[0-9]*_[0-9]*_[0-9]*' | \
-            sort -V | tail -1 | sed 's/refs\/tags\///')
-          
-          # 如果官方源失败，尝试 GitHub 镜像
+          # 注意:busybox.net 的 git:// 协议现在不太稳,改用 https
+          LATEST_VERSION=$(git ls-remote --tags https://git.busybox.net/busybox 2>/dev/null | \
+            grep -o 'refs/tags/[0-9]*_[0-9]*_[0-9]*$' | \
+            sort -V | tail -1 | sed 's|refs/tags/||')
+
+          # 如果官方源失败,尝试 GitHub 镜像
           if [ -z "$LATEST_VERSION" ]; then
-            echo "官方源不可用，尝试GitHub镜像..."
-            LATEST_VERSION=$(git ls-remote --tags https://github.com/vda-linux/busybox_mirror | \
-              grep -o 'refs/tags/[0-9]*_[0-9]*_[0-9]*' | \
-              sort -V | tail -1 | sed 's/refs\/tags\///')
+            echo "官方源不可用,尝试 GitHub 镜像..."
+            LATEST_VERSION=$(git ls-remote --tags https://github.com/vda-linux/busybox_mirror 2>/dev/null | \
+              grep -o 'refs/tags/[0-9]*_[0-9]*_[0-9]*$' | \
+              sort -V | tail -1 | sed 's|refs/tags/||')
           fi
-          
+
+          # 再兜底:从下载页抓 tarball 名
+          if [ -z "$LATEST_VERSION" ]; then
+            echo "Git 源都不可用,从下载页解析最新版本..."
+            LATEST_VERSION=$(curl -fsSL https://busybox.net/downloads/ 2>/dev/null | \
+              grep -oE 'busybox-[0-9]+\.[0-9]+\.[0-9]+\.tar\.bz2' | \
+              sort -V | tail -1 | sed -E 's/busybox-|\.tar\.bz2//g' | tr '.' '_')
+          fi
+
+          if [ -z "$LATEST_VERSION" ]; then
+            echo "::error::无法获取 BusyBox 最新版本"
+            exit 1
+          fi
+
           echo "最新版本: $LATEST_VERSION"
-          echo "latest-version=$LATEST_VERSION" >> $GITHUB_OUTPUT
-          
-          if git tag --list | grep -q "busybox-$LATEST_VERSION"; then
-            echo "版本 $LATEST_VERSION 已存在，跳过构建"
-            echo "skip=true" >> $GITHUB_OUTPUT
+          echo "latest-version=$LATEST_VERSION" >> "$GITHUB_OUTPUT"
+
+          if git tag --list | grep -q "^busybox-${LATEST_VERSION}$"; then
+            echo "版本 $LATEST_VERSION 已存在,跳过构建"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            echo "版本 $LATEST_VERSION 不存在，开始构建"
-            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "版本 $LATEST_VERSION 不存在,开始构建"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
   # Job 2: 矩阵并行构建
@@ -53,36 +70,42 @@ jobs:
     needs: check-version
     if: needs.check-version.outputs.skip == 'false'
     runs-on: ubuntu-latest
-    
+
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: arm
             ndk-version: r29
-            clang_target: "armv7a-linux-androideabi21-clang"
+            clang_triple: armv7a-linux-androideabi
             make_arch: arm
+            api: 21
           - arch: arm64
             ndk-version: r29
-            clang_target: "aarch64-linux-android21-clang"
+            clang_triple: aarch64-linux-android
             make_arch: arm64
+            api: 21
           - arch: x86
             ndk-version: r29
-            clang_target: "i686-linux-android21-clang"
+            clang_triple: i686-linux-android
             make_arch: x86
+            api: 21
           - arch: x86_64
             ndk-version: r29
-            clang_target: "x86_64-linux-android21-clang"
+            clang_triple: x86_64-linux-android
             make_arch: x86_64
-          # MIPS 架构：使用旧版 NDK r23c (NDK r24+ 已彻底移除 MIPS 支持)
+            api: 21
+          # MIPS 架构:NDK r24+ 已彻底移除,固定使用 r23c
           - arch: mips
             ndk-version: r23c
-            clang_target: "mipsel-linux-android21-clang"
+            clang_triple: mipsel-linux-android
             make_arch: mips
+            api: 21
           - arch: mips64
             ndk-version: r23c
-            clang_target: "mips64el-linux-android21-clang"
+            clang_triple: mips64el-linux-android
             make_arch: mips
+            api: 21
 
     steps:
       - name: 检出仓库
@@ -101,67 +124,139 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential bzip2 make libncurses5-dev
 
-      - name: 下载 BusyBox 源码 (使用下划线版本号 1_37_0)
+      - name: 下载 BusyBox 源码
         run: |
-          # 优先使用 git clone，checkout 时使用下划线格式的 tag
-          git clone git://busybox.net/busybox.git
-          cd busybox
-          git checkout ${{ needs.check-version.outputs.latest-version }}
-          
-          # 如果失败，使用下载方式 (将下划线替换为点号用于下载文件名)
-          if [ $? -ne 0 ]; then
-            echo "Git clone 失败，尝试下载源码包..."
-            cd ..
-            rm -rf busybox
-            VERSION_DOTTED=$(echo "${{ needs.check-version.outputs.latest-version }}" | tr '_' '.')
-            wget -qO busybox.tar.bz2 "https://busybox.net/downloads/busybox-${VERSION_DOTTED}.tar.bz2"
+          VERSION="${{ needs.check-version.outputs.latest-version }}"
+          VERSION_DOTTED=$(echo "$VERSION" | tr '_' '.')
+          echo "下载版本: $VERSION (tarball 名: busybox-${VERSION_DOTTED})"
+
+          # 优先用 https 拉 git 源 (git:// 协议在 CI 里经常挂)
+          if git clone --depth 1 --branch "$VERSION" https://git.busybox.net/busybox.git busybox 2>/dev/null; then
+            echo "git clone 成功"
+          else
+            echo "git clone 失败,改下源码包..."
+            wget -qO busybox.tar.bz2 "https://www.busybox.net/downloads/busybox-${VERSION_DOTTED}.tar.bz2"
             tar -xjf busybox.tar.bz2
-            mv busybox-${VERSION_DOTTED} busybox
+            mv "busybox-${VERSION_DOTTED}" busybox
           fi
+
+          # 验证源码就位
+          ls busybox/busybox >/dev/null || (echo "::error::源码未正确下载" && exit 1)
 
       - name: 应用 Android NDK 兼容补丁
         run: |
           cd busybox
-          # 下载 osm0sis 的补丁，解决 BusyBox 与 Android Bionic libc 的兼容性问题
-          wget -qO- https://github.com/osm0sis/android-busybox-ndk/archive/refs/heads/master.tar.gz | tar xz
-          cp -r android-busybox-ndk-master/patches/* . 2>/dev/null || true
-          for patch in patches/*.patch; do
-            [ -e "$patch" ] && patch -p1 < "$patch" || true
-          done
+          # osm0sis 的补丁,解决 BusyBox 与 Android Bionic libc 的兼容性问题
+          if wget -qO- https://github.com/osm0sis/android-busybox-ndk/archive/refs/heads/master.tar.gz | tar xz; then
+            # 复制所有 patch 文件
+            if [ -d android-busybox-ndk-master/patches ]; then
+              cp android-busybox-ndk-master/patches/* . 2>/dev/null || true
+            fi
+            for patch in patches/*.patch; do
+              if [ -e "$patch" ]; then
+                echo "应用补丁: $patch"
+                # -N 跳过已应用的,避免一个 patch 失败导致整个 job 挂掉
+                patch -p1 -N < "$patch" || echo "  (已应用或部分冲突,继续)"
+              fi
+            done
+          else
+            echo "警告:补丁下载失败,继续裸编译"
+          fi
 
-      - name: 配置与编译 (直接指定 Clang 路径，绕过符号链接错误)
+      - name: 探测 NDK clang 二进制
+        id: probe-clang
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          cd busybox
           NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          export PATH="$NDK_BIN:$PATH"
-          
-          # 直接使用 NDK 中的 Clang 编译器，不创建任何符号链接，避免 clang 找不到的错误
+
+          # 调试用:把 bin 目录里所有 clang 相关的都列出来
+          echo "=== bin 目录里的 clang 相关文件 ==="
+          ls "$NDK_BIN" 2>/dev/null | grep -i clang || echo "(无)"
+
+          # 找到真实的 clang 二进制 (排除 -clang 后缀的 wrapper 脚本和 clang++)
+          # 优先级:clang (无后缀) > clang-XX > clang-N
+          CLANG_PATH=""
+          for cand in clang clang-21 clang-20 clang-19 clang-18 clang-17 clang-15 clang; do
+            if [ -x "$NDK_BIN/$cand" ] && [ ! -L "$NDK_BIN/$cand" ]; then
+              CLANG_PATH="$NDK_BIN/$cand"
+              break
+            fi
+          done
+
+          if [ -z "$CLANG_PATH" ]; then
+            echo "::error::在 $NDK_BIN 下找不到 clang 二进制"
+            echo "目录内容:"
+            ls -la "$NDK_BIN"
+            exit 1
+          fi
+
+          echo "找到 clang: $CLANG_PATH"
+          "$CLANG_PATH" --version
+
+          # 验证 sysroot 存在
+          SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          if [ ! -d "$SYSROOT" ]; then
+            echo "::error::sysroot 不存在: $SYSROOT"
+            exit 1
+          fi
+
+          {
+            echo "clang=$CLANG_PATH"
+            echo "sysroot=$SYSROOT"
+            echo "ndk_bin=$NDK_BIN"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 配置与编译
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CLANG: ${{ steps.probe-clang.outputs.clang }}
+          SYSROOT: ${{ steps.probe-clang.outputs.sysroot }}
+          NDK_BIN: ${{ steps.probe-clang.outputs.ndk_bin }}
+        run: |
+          cd busybox
+
+          # CLANG_TRIPLE 是 BusyBox 专为 Android clang 提供的 make 变量
+          # 它会让 CC 变成 "clang --target=<triple><api> --sysroot=..."
+          # 不要再用 NDK 里的 xxx-linux-android21-clang 包装脚本
+          # (r29 里那个脚本内部还是调 clang,排版有变就直接炸)
           make ARCH=${{ matrix.make_arch }} \
-               CC="$NDK_BIN/${{ matrix.clang_target }}" \
+               CC="$CLANG" \
+               CLANG_TRIPLE="${{ matrix.clang_triple }}${{ matrix.api }}" \
                STRIP="$NDK_BIN/llvm-strip" \
                AR="$NDK_BIN/llvm-ar" \
                RANLIB="$NDK_BIN/llvm-ranlib" \
+               CFLAGS="--sysroot=$SYSROOT" \
+               LDFLAGS="--sysroot=$SYSROOT" \
                defconfig
-          
-          # 开启静态编译，确保二进制文件在 Android 上独立运行无依赖
-          sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
-          # 关闭在 Android 上不兼容的特性
-          sed -i 's/CONFIG_FEATURE_WTMP=y/# CONFIG_FEATURE_WTMP is not set/' .config
-          sed -i 's/CONFIG_FEATURE_UTMP=y/# CONFIG_FEATURE_UTMP is not set/' .config
-          
-          # 多线程并行编译
+
+          # 静态编译:让 binary 独立运行
+          sed -i 's|# CONFIG_STATIC is not set|CONFIG_STATIC=y|' .config
+          # 关掉 Android 上有问题的特性
+          sed -i 's|CONFIG_FEATURE_WTMP=y|# CONFIG_FEATURE_WTMP is not set|' .config
+          sed -i 's|CONFIG_FEATURE_UTMP=y|# CONFIG_FEATURE_UTMP is not set|' .config
+          # 关掉 crosstool/NDK 容易炸的 selinux/namespace 相关选项
+          sed -i 's|CONFIG_FEATURE_NSLOOKUP=y|# CONFIG_FEATURE_NSLOOKUP is not set|' .config || true
+
+          # 关键:make 编译时同样要传 CLANG_TRIPLE,否则会退回到 host 编译
           make ARCH=${{ matrix.make_arch }} \
-               CC="$NDK_BIN/${{ matrix.clang_target }}" \
+               CC="$CLANG" \
+               CLANG_TRIPLE="${{ matrix.clang_triple }}${{ matrix.api }}" \
                STRIP="$NDK_BIN/llvm-strip" \
                AR="$NDK_BIN/llvm-ar" \
                RANLIB="$NDK_BIN/llvm-ranlib" \
-               -j$(nproc)
-          
-          # 剥离调试信息
+               CFLAGS="--sysroot=$SYSROOT" \
+               LDFLAGS="--sysroot=$SYSROOT" \
+               -j"$(nproc)"
+
+          # 验证产物
+          file busybox
+          ls -la busybox
+
+          # 二次 strip 瘦身
           "$NDK_BIN/llvm-strip" busybox
-          mv busybox busybox-${{ matrix.arch }}
+          mv busybox "busybox-${{ matrix.arch }}"
+          ls -la "busybox-${{ matrix.arch }}"
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
@@ -179,6 +274,8 @@ jobs:
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 推送 tag 需要历史,否则 softprops 可能推不上去
 
       - name: 下载所有构建产物
         uses: actions/download-artifact@v4
@@ -186,24 +283,61 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: 打包发布文件
+      - name: 验证产物并生成 SHA256
         run: |
           mkdir -p release
-          cp artifacts/busybox-* release/
-          cd release
-          tar -czvf busybox-ndk-all-arch-${{ needs.check-version.outputs.latest-version }}.tar.gz busybox-*
-          
+          cd artifacts
+          # 检查每个架构都有产物
+          for arch in arm arm64 x86 x86_64 mips mips64; do
+            if [ ! -f "busybox-$arch" ]; then
+              echo "::error::缺少 busybox-$arch 产物"
+              exit 1
+            fi
+            file "busybox-$arch"
+          done
+          cp busybox-* ../release/
+          cd ../release
+          sha256sum busybox-* > SHA256SUMS
+          cat SHA256SUMS
+          tar -czf "busybox-ndk-all-arch-${{ needs.check-version.outputs.latest-version }}.tar.gz" busybox-*
+          ls -la
+
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release/busybox-ndk-all-arch-${{ needs.check-version.outputs.latest-version }}.tar.gz
+          files: |
+            release/busybox-ndk-all-arch-${{ needs.check-version.outputs.latest-version }}.tar.gz
+            release/SHA256SUMS
           tag_name: busybox-${{ needs.check-version.outputs.latest-version }}
-          name: BusyBox NDK ${{ needs.check-version.outputs.latest-version }}
+          name: "BusyBox NDK ${{ needs.check-version.outputs.latest-version }}"
           body: |
-            ## BusyBox NDK 多架构二进制文件
-            
-            版本: ${{ needs.check-version.outputs.latest-version }}
-            包含架构: ARM, ARM64, x86, x86_64, MIPS, MIPS64
-            (MIPS 架构使用 NDK r23c 编译，其他架构使用 NDK r29)
+            ## BusyBox NDK 多架构二进制
+
+            版本: `${{ needs.check-version.outputs.latest-version }}`
+
+            包含架构:
+            - ARM (armv7a) — NDK r29
+            - ARM64 (aarch64) — NDK r29
+            - x86 (i686) — NDK r29
+            - x86_64 — NDK r29
+            - MIPS (mipsel) — NDK r23c
+            - MIPS64 (mips64el) — NDK r23c
+
+            API 等级: 21 (Android 5.0 Lollipop)
+
+            ## 使用方法
+
+            ```bash
+            # 举例:推到 Android 设备
+            adb push busybox-arm64 /data/local/tmp/busybox
+            adb shell chmod 755 /data/local/tmp/busybox
+            adb shell /data/local/tmp/busybox --install -s /data/local/tmp/bb
+            ```
+
+            ## 校验
+
+            下载 `SHA256SUMS` 并执行 `sha256sum -c SHA256SUMS` 验证完整性。
+
+            提示:MIPS 架构 NDK r24+ 已停止支持,本仓库固定使用 r23c 编译。
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
