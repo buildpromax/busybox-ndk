@@ -130,18 +130,52 @@ jobs:
           VERSION_DOTTED=$(echo "$VERSION" | tr '_' '.')
           echo "下载版本: $VERSION (tarball 名: busybox-${VERSION_DOTTED})"
 
-          # 优先用 https 拉 git 源 (git:// 协议在 CI 里经常挂)
-          if git clone --depth 1 --branch "$VERSION" https://git.busybox.net/busybox.git busybox 2>/dev/null; then
-            echo "git clone 成功"
-          else
-            echo "git clone 失败,改下源码包..."
-            wget -qO busybox.tar.bz2 "https://www.busybox.net/downloads/busybox-${VERSION_DOTTED}.tar.bz2"
-            tar -xjf busybox.tar.bz2
-            mv "busybox-${VERSION_DOTTED}" busybox
+          rm -rf busybox busybox.tar.bz2
+          CLONE_OK=0
+
+          # 1. 尝试 git clone (完整历史,后续可以 checkout tag)
+          if git clone --quiet https://git.busybox.net/busybox.git busybox 2>/dev/null; then
+            cd busybox
+            if git checkout --quiet "$VERSION" 2>/dev/null; then
+              echo "git clone + checkout 成功"
+              CLONE_OK=1
+            else
+              echo "checkout $VERSION 失败,可能 tag 不存在,留在默认分支"
+              cd ..
+              rm -rf busybox
+            fi
           fi
 
-          # 验证源码就位
-          ls busybox/busybox >/dev/null || (echo "::error::源码未正确下载" && exit 1)
+          # 2. 失败就下载 tarball
+          if [ "$CLONE_OK" -ne 1 ]; then
+            echo "git 方式失败,改下源码包..."
+            if wget -qO busybox.tar.bz2 "https://www.busybox.net/downloads/busybox-${VERSION_DOTTED}.tar.bz2"; then
+              tar -xjf busybox.tar.bz2
+              # 源码包解压后的目录名是 busybox-VERSION (带点号)
+              if [ -d "busybox-${VERSION_DOTTED}" ]; then
+                mv "busybox-${VERSION_DOTTED}" busybox
+              elif [ -d busybox ]; then
+                : # 某些 tarball 可能直接展开成 busybox/
+              else
+                echo "::error::tarball 解压后找不到 busybox 目录"
+                ls -la
+                exit 1
+              fi
+            else
+              echo "::error::源码下载完全失败"
+              exit 1
+            fi
+          fi
+
+          # 验证源码目录就位 (检查标志性文件 Makefile 和 busybox.c,而不是编译产物 busybox)
+          if [ ! -f busybox/Makefile ] || [ ! -f busybox/busybox.c ]; then
+            echo "::error::源码不完整,Makefile 或 busybox.c 缺失"
+            ls -la busybox/ 2>/dev/null | head -20
+            exit 1
+          fi
+
+          echo "源码就位: busybox/Makefile + busybox/busybox.c 都存在"
+          head -3 busybox/Makefile
 
       - name: 应用 Android NDK 兼容补丁
         run: |
