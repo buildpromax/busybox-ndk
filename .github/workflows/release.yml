@@ -127,13 +127,11 @@ jobs:
           SRC_OK=0
 
           # 1. 优先 wget tarball —— 体积小(~2.5MB)、可重试,比 git clone 稳得多
-          #    busybox.net 的 git server 时不时抽风,clone 完整历史不划算
           for i in 1 2 3; do
             echo "尝试下载 tarball (第 $i 次)..."
             if wget --timeout=60 --tries=1 --retry-connrefused --waitretry=5 \
                    -qO busybox.tar.bz2 \
                    "https://www.busybox.net/downloads/busybox-${VERSION_DOTTED}.tar.bz2"; then
-              # 验证不是 HTML 错误页
               if file busybox.tar.bz2 | grep -q 'bzip2'; then
                 echo "tarball 下载成功"
                 SRC_OK=1
@@ -152,14 +150,12 @@ jobs:
             echo "tarball 三次都失败,改用 git clone..."
             for i in 1 2 3; do
               echo "git clone 尝试 $i..."
-              # 用 GitHub 镜像,比 git.busybox.net 稳
               if git clone --depth 1 --branch "$VERSION" --quiet \
                    https://github.com/vda-linux/busybox_mirror.git busybox 2>/dev/null; then
                 echo "git clone --branch 成功"
                 SRC_OK=1
                 break
               fi
-              # 再试默认分支
               if git clone --depth 1 --quiet \
                    https://github.com/vda-linux/busybox_mirror.git busybox 2>/dev/null; then
                 (cd busybox && \
@@ -180,7 +176,6 @@ jobs:
           if [ "$SRC_OK" -eq 1 ] && [ -f busybox.tar.bz2 ]; then
             echo "解压 tarball..."
             tar -xjf busybox.tar.bz2
-            # 源码包解压后目录名是 busybox-VERSION (带点号)
             if [ -d "busybox-${VERSION_DOTTED}" ]; then
               mv "busybox-${VERSION_DOTTED}" busybox
             elif [ -d busybox ]; then
@@ -198,14 +193,24 @@ jobs:
           fi
 
           # 验证源码目录就位
-          if [ ! -f busybox/Makefile ] || [ ! -f busybox/busybox.c ]; then
-            echo "::error::源码不完整,Makefile 或 busybox.c 缺失"
+          # busybox.c 在 1.36+ 已经被移走了 (入口改成 libbb/appletlib.c 里的 main),
+          # 不能再用 busybox.c 当存在性标志。改用 Makefile + applets/ + libbb/ 三个标志位
+          if [ ! -f busybox/Makefile ]; then
+            echo "::error::源码不完整,Makefile 缺失"
             ls -la busybox/ 2>/dev/null | head -20
             exit 1
           fi
 
-          echo "源码就位: busybox/Makefile + busybox/busybox.c 都存在"
-          head -3 busybox/Makefile
+          if [ ! -d busybox/applets ] || [ ! -d busybox/libbb ]; then
+            echo "::error::源码不完整,applets/ 或 libbb/ 目录缺失(不是 busybox 源码根)"
+            ls -la busybox/ 2>/dev/null | head -20
+            exit 1
+          fi
+
+          echo "源码就位: Makefile + applets/ + libbb/ 都存在"
+          head -5 busybox/Makefile
+          echo "---"
+          grep -E '^VERSION' busybox/Makefile | head -3 || true
 
       - name: 应用 Android NDK 兼容补丁
         run: |
@@ -283,7 +288,6 @@ jobs:
           # CLANG_TRIPLE 是 BusyBox 专为 Android clang 提供的 make 变量
           # 它会让 CC 变成 "clang --target=<triple><api> --sysroot=..."
           # 不要再用 NDK 里的 xxx-linux-android21-clang 包装脚本
-          # (r29 里那个脚本内部还是调 clang,排版有变就直接炸)
           make ARCH=${{ matrix.make_arch }} \
                CC="$CLANG" \
                CLANG_TRIPLE="${{ matrix.clang_triple }}${{ matrix.api }}" \
