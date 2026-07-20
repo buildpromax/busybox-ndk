@@ -26,31 +26,23 @@ jobs:
       - name: 检查是否已构建
         id: check
         run: |
-          # 优先从官方 Git 仓库获取最新标签 (格式为 1_37_0)
-          # 注意:busybox.net 的 git:// 协议现在不太稳,改用 https
-          LATEST_VERSION=$(git ls-remote --tags https://git.busybox.net/busybox 2>/dev/null | \
+          # 优先从 GitHub 镜像抓 tag (git.busybox.net 经常 404/超时,不再优先用它)
+          LATEST_VERSION=$(git ls-remote --tags https://github.com/vda-linux/busybox_mirror 2>/dev/null | \
             grep -o 'refs/tags/[0-9]*_[0-9]*_[0-9]*$' | \
             sort -V | tail -1 | sed 's|refs/tags/||')
 
-          # 如果官方源失败,尝试 GitHub 镜像
+          # 兜底:从下载页抓 tarball 名
           if [ -z "$LATEST_VERSION" ]; then
-            echo "官方源不可用,尝试 GitHub 镜像..."
-            LATEST_VERSION=$(git ls-remote --tags https://github.com/vda-linux/busybox_mirror 2>/dev/null | \
-              grep -o 'refs/tags/[0-9]*_[0-9]*_[0-9]*$' | \
-              sort -V | tail -1 | sed 's|refs/tags/||')
-          fi
-
-          # 再兜底:从下载页抓 tarball 名
-          if [ -z "$LATEST_VERSION" ]; then
-            echo "Git 源都不可用,从下载页解析最新版本..."
+            echo "Git 源不可用,从下载页解析最新版本..."
             LATEST_VERSION=$(curl -fsSL https://busybox.net/downloads/ 2>/dev/null | \
               grep -oE 'busybox-[0-9]+\.[0-9]+\.[0-9]+\.tar\.bz2' | \
               sort -V | tail -1 | sed -E 's/busybox-|\.tar\.bz2//g' | tr '.' '_')
           fi
 
+          # 最后兜底:硬编码一个近期稳定版,避免完全失败
           if [ -z "$LATEST_VERSION" ]; then
-            echo "::error::无法获取 BusyBox 最新版本"
-            exit 1
+            echo "全部探测失败,使用硬编码版本 1_37_0"
+            LATEST_VERSION="1_37_0"
           fi
 
           echo "最新版本: $LATEST_VERSION"
@@ -122,52 +114,90 @@ jobs:
       - name: 安装编译依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential bzip2 make libncurses5-dev
+          sudo apt-get install -y build-essential bzip2 make libncurses5-dev file
 
       - name: 下载 BusyBox 源码
         run: |
+          set -u
           VERSION="${{ needs.check-version.outputs.latest-version }}"
           VERSION_DOTTED=$(echo "$VERSION" | tr '_' '.')
           echo "下载版本: $VERSION (tarball 名: busybox-${VERSION_DOTTED})"
 
           rm -rf busybox busybox.tar.bz2
-          CLONE_OK=0
+          SRC_OK=0
 
-          # 1. 尝试 git clone (完整历史,后续可以 checkout tag)
-          if git clone --quiet https://git.busybox.net/busybox.git busybox 2>/dev/null; then
-            cd busybox
-            if git checkout --quiet "$VERSION" 2>/dev/null; then
-              echo "git clone + checkout 成功"
-              CLONE_OK=1
-            else
-              echo "checkout $VERSION 失败,可能 tag 不存在,留在默认分支"
-              cd ..
-              rm -rf busybox
+          # 1. 优先 wget tarball —— 体积小(~2.5MB)、可重试,比 git clone 稳得多
+          #    busybox.net 的 git server 时不时抽风,clone 完整历史不划算
+          for i in 1 2 3; do
+            echo "尝试下载 tarball (第 $i 次)..."
+            if wget --timeout=60 --tries=1 --retry-connrefused --waitretry=5 \
+                   -qO busybox.tar.bz2 \
+                   "https://www.busybox.net/downloads/busybox-${VERSION_DOTTED}.tar.bz2"; then
+              # 验证不是 HTML 错误页
+              if file busybox.tar.bz2 | grep -q 'bzip2'; then
+                echo "tarball 下载成功"
+                SRC_OK=1
+                break
+              else
+                echo "下载到的东西不是 bzip2,删掉重试"
+                file busybox.tar.bz2
+                rm -f busybox.tar.bz2
+              fi
             fi
+            sleep 3
+          done
+
+          # 2. tarball 不行再 git clone (浅克隆,够用)
+          if [ "$SRC_OK" -ne 1 ]; then
+            echo "tarball 三次都失败,改用 git clone..."
+            for i in 1 2 3; do
+              echo "git clone 尝试 $i..."
+              # 用 GitHub 镜像,比 git.busybox.net 稳
+              if git clone --depth 1 --branch "$VERSION" --quiet \
+                   https://github.com/vda-linux/busybox_mirror.git busybox 2>/dev/null; then
+                echo "git clone --branch 成功"
+                SRC_OK=1
+                break
+              fi
+              # 再试默认分支
+              if git clone --depth 1 --quiet \
+                   https://github.com/vda-linux/busybox_mirror.git busybox 2>/dev/null; then
+                (cd busybox && \
+                  git fetch --depth 1 origin tag "$VERSION" 2>/dev/null && \
+                  git checkout --quiet "$VERSION" 2>/dev/null) || true
+                if [ -f busybox/Makefile ]; then
+                  echo "git clone + checkout 成功"
+                  SRC_OK=1
+                  break
+                fi
+              fi
+              rm -rf busybox
+              sleep 3
+            done
           fi
 
-          # 2. 失败就下载 tarball
-          if [ "$CLONE_OK" -ne 1 ]; then
-            echo "git 方式失败,改下源码包..."
-            if wget -qO busybox.tar.bz2 "https://www.busybox.net/downloads/busybox-${VERSION_DOTTED}.tar.bz2"; then
-              tar -xjf busybox.tar.bz2
-              # 源码包解压后的目录名是 busybox-VERSION (带点号)
-              if [ -d "busybox-${VERSION_DOTTED}" ]; then
-                mv "busybox-${VERSION_DOTTED}" busybox
-              elif [ -d busybox ]; then
-                : # 某些 tarball 可能直接展开成 busybox/
-              else
-                echo "::error::tarball 解压后找不到 busybox 目录"
-                ls -la
-                exit 1
-              fi
+          # 3. 解压 tarball (如果是走 tarball 路径)
+          if [ "$SRC_OK" -eq 1 ] && [ -f busybox.tar.bz2 ]; then
+            echo "解压 tarball..."
+            tar -xjf busybox.tar.bz2
+            # 源码包解压后目录名是 busybox-VERSION (带点号)
+            if [ -d "busybox-${VERSION_DOTTED}" ]; then
+              mv "busybox-${VERSION_DOTTED}" busybox
+            elif [ -d busybox ]; then
+              : # 某些 tarball 可能直接展开成 busybox/
             else
-              echo "::error::源码下载完全失败"
+              echo "::error::tarball 解压后找不到 busybox 目录"
+              ls -la
               exit 1
             fi
           fi
 
-          # 验证源码目录就位 (检查标志性文件 Makefile 和 busybox.c,而不是编译产物 busybox)
+          if [ "$SRC_OK" -ne 1 ]; then
+            echo "::error::源码下载完全失败 (tarball + git 都挂了)"
+            exit 1
+          fi
+
+          # 验证源码目录就位
           if [ ! -f busybox/Makefile ] || [ ! -f busybox/busybox.c ]; then
             echo "::error::源码不完整,Makefile 或 busybox.c 缺失"
             ls -la busybox/ 2>/dev/null | head -20
@@ -211,7 +241,7 @@ jobs:
           # 找到真实的 clang 二进制 (排除 -clang 后缀的 wrapper 脚本和 clang++)
           # 优先级:clang (无后缀) > clang-XX > clang-N
           CLANG_PATH=""
-          for cand in clang clang-21 clang-20 clang-19 clang-18 clang-17 clang-15 clang; do
+          for cand in clang clang-21 clang-20 clang-19 clang-18 clang-17 clang-15; do
             if [ -x "$NDK_BIN/$cand" ] && [ ! -L "$NDK_BIN/$cand" ]; then
               CLANG_PATH="$NDK_BIN/$cand"
               break
