@@ -19,7 +19,7 @@ jobs:
       skip: ${{ steps.check.outputs.skip }}
     steps:
       - name: 检出仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -101,11 +101,11 @@ jobs:
 
     steps:
       - name: 检出仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 设置 NDK ${{ matrix.ndk-version }}
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@v1.6.0
         with:
           ndk-version: ${{ matrix.ndk-version }}
           add-to-path: false
@@ -216,8 +216,6 @@ jobs:
         run: |
           cd busybox
           # osm0sis 的补丁,解决 BusyBox 与 Android Bionic libc 的兼容性问题
-          # 注意:osm0sis/android-busybox-ndk 现在 master 分支里没有 build.sh 了,
-          # 但 patches/ 目录还在,我们只要里面的 patch 文件
           if wget -qO- https://github.com/osm0sis/android-busybox-ndk/archive/refs/heads/master.tar.gz | tar xz; then
             if [ -d android-busybox-ndk-master/patches ]; then
               echo "找到 patches 目录,逐个应用"
@@ -236,58 +234,73 @@ jobs:
             echo "警告:补丁下载失败,继续裸编译"
           fi
 
-      - name: 探测 NDK clang 二进制
+      - name: 探测 NDK 工具链
         id: probe-clang
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          # 调试用:把 bin 目录里所有 clang 相关的都列出来
-          echo "=== bin 目录里的 clang 相关文件 ==="
-          ls "$NDK_BIN" 2>/dev/null | grep -i clang | head -20
+          # 【关键】用 NDK 自带的 wrapper 而不是裸 clang。
+          # NDK 在 bin 目录下提供了 <triple><api>-clang 这样的包装脚本,
+          # 它们内部已经正确设置好 --target= --sysroot= -fuse-ld=lld 等所有
+          # Android 编译需要的参数。直接用它们就行,不要再自己拼参数。
+          TRIPLE="${{ matrix.clang_triple }}${{ matrix.api }}"
+          CLANG_WRAPPER="$NDK_BIN/${TRIPLE}-clang"
 
-          # 找到真实的 clang 二进制 (排除 -clang 后缀的 wrapper 脚本和 clang++)
-          # 优先级:clang (无后缀) > clang-XX > clang-N
-          CLANG_PATH=""
-          for cand in clang clang-21 clang-20 clang-19 clang-18 clang-17 clang-15; do
-            if [ -x "$NDK_BIN/$cand" ] && [ ! -L "$NDK_BIN/$cand" ]; then
-              CLANG_PATH="$NDK_BIN/$cand"
+          if [ ! -x "$CLANG_WRAPPER" ]; then
+            echo "::error::找不到 NDK wrapper: $CLANG_WRAPPER"
+            echo "bin 目录里 -clang 结尾的文件:"
+            ls "$NDK_BIN" 2>/dev/null | grep '\-clang$' | head -20
+            exit 1
+          fi
+
+          echo "找到 NDK wrapper: $CLANG_WRAPPER"
+          "$CLANG_WRAPPER" --version
+
+          # 找 strip/ar/ranlib (NDK r29 这些工具改叫 llvm-strip / llvm-ar / llvm-ranlib
+          # 但 NDK 内部还可能放别处,做一次发现)
+          STRIP_BIN=""
+          for cand in llvm-strip strip; do
+            if [ -x "$NDK_BIN/$cand" ]; then
+              STRIP_BIN="$NDK_BIN/$cand"
               break
             fi
           done
 
-          if [ -z "$CLANG_PATH" ]; then
-            echo "::error::在 $NDK_BIN 下找不到 clang 二进制"
-            echo "目录内容:"
-            ls -la "$NDK_BIN"
+          AR_BIN=""
+          for cand in llvm-ar ar; do
+            if [ -x "$NDK_BIN/$cand" ]; then
+              AR_BIN="$NDK_BIN/$cand"
+              break
+            fi
+          done
+
+          RANLIB_BIN=""
+          for cand in llvm-ranlib ranlib; do
+            if [ -x "$NDK_BIN/$cand" ]; then
+              RANLIB_BIN="$NDK_BIN/$cand"
+              break
+            fi
+          done
+
+          if [ -z "$STRIP_BIN" ] || [ -z "$AR_BIN" ] || [ -z "$RANLIB_BIN" ]; then
+            echo "::error::NDK 工具不全:"
+            echo "  STRIP=$STRIP_BIN"
+            echo "  AR=$AR_BIN"
+            echo "  RANLIB=$RANLIB_BIN"
+            echo "bin 目录里 strip/ar/ranlib 相关的:"
+            ls "$NDK_BIN" 2>/dev/null | grep -E 'strip|ar$|ranlib'
             exit 1
           fi
 
-          echo "找到 clang: $CLANG_PATH"
-          "$CLANG_PATH" --version
-
-          # 验证 sysroot 存在
-          SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
-          if [ ! -d "$SYSROOT" ]; then
-            echo "::error::sysroot 不存在: $SYSROOT"
-            exit 1
-          fi
-
-          # 验证目标架构的 asm 头目录存在 (否则 NDK 包有问题)
-          ARCH_DIR="$SYSROOT/usr/include/${{ matrix.clang_triple }}"
-          if [ ! -d "$ARCH_DIR/asm" ]; then
-            echo "::error::目标架构 asm 头目录不存在: $ARCH_DIR/asm"
-            echo "NDK 包可能下载不完整,目录内容:"
-            ls "$SYSROOT/usr/include/" 2>/dev/null | head -10
-            exit 1
-          fi
-          echo "目标 asm 头目录 OK: $ARCH_DIR/asm"
-          ls "$ARCH_DIR/asm/" 2>/dev/null | head -5
+          echo "工具链 OK: $CLANG_WRAPPER / $STRIP_BIN / $AR_BIN / $RANLIB_BIN"
 
           {
-            echo "clang=$CLANG_PATH"
-            echo "sysroot=$SYSROOT"
+            echo "clang=$CLANG_WRAPPER"
+            echo "strip=$STRIP_BIN"
+            echo "ar=$AR_BIN"
+            echo "ranlib=$RANLIB_BIN"
             echo "ndk_bin=$NDK_BIN"
           } >> "$GITHUB_OUTPUT"
 
@@ -295,26 +308,24 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           CLANG: ${{ steps.probe-clang.outputs.clang }}
-          SYSROOT: ${{ steps.probe-clang.outputs.sysroot }}
-          NDK_BIN: ${{ steps.probe-clang.outputs.ndk_bin }}
+          STRIP: ${{ steps.probe-clang.outputs.strip }}
+          AR: ${{ steps.probe-clang.outputs.ar }}
+          RANLIB: ${{ steps.probe-clang.outputs.ranlib }}
         run: |
           cd busybox
 
-          # 【关键修复】把 --target= 和 --sysroot= 都塞进 CC/CFLAGS/LDFLAGS。
-          # 之前用的 CLANG_TRIPLE 这个变量 BusyBox 根本不识别 (BusyBox 根 Makefile 里
-          # 没有这个变量,CC 默认是 $(CROSS_COMPILE)gcc)。我们直接绕过这个变量,
-          # 用 --target= 让 clang 知道目标架构,这样 NDK 的 linux/types.h 才能
-          # 正确解析到 <arch>-linux-android/asm/types.h。
-          TARGET="${{ matrix.clang_triple }}${{ matrix.api }}"
-          COMMON_FLAGS="--target=$TARGET --sysroot=$SYSROOT"
-
+          # 【关键修复】用 NDK 自己的 wrapper 替换裸 clang。
+          # wrapper = <triple><api>-clang,它内部已经处理好了所有 Android 编译需要的参数:
+          #   --target=<triple><api>
+          #   --sysroot=<NDK>/sysroot
+          #   -fuse-ld=lld (并知道 ld.lld 在哪)
+          # 之前手动传 --target= --sysroot= 时漏了 -fuse-ld,导致链接器找不到 ld.lld。
+          # 用 wrapper 就一劳永逸。
           make ARCH=${{ matrix.make_arch }} \
-               CC="$CLANG $COMMON_FLAGS" \
-               STRIP="$NDK_BIN/llvm-strip" \
-               AR="$NDK_BIN/llvm-ar" \
-               RANLIB="$NDK_BIN/llvm-ranlib" \
-               CFLAGS="$COMMON_FLAGS" \
-               LDFLAGS="$COMMON_FLAGS" \
+               CC="$CLANG" \
+               STRIP="$STRIP" \
+               AR="$AR" \
+               RANLIB="$RANLIB" \
                defconfig
 
           # 静态编译:让 binary 独立运行
@@ -327,12 +338,10 @@ jobs:
 
           # 编译
           make ARCH=${{ matrix.make_arch }} \
-               CC="$CLANG $COMMON_FLAGS" \
-               STRIP="$NDK_BIN/llvm-strip" \
-               AR="$NDK_BIN/llvm-ar" \
-               RANLIB="$NDK_BIN/llvm-ranlib" \
-               CFLAGS="$COMMON_FLAGS" \
-               LDFLAGS="$COMMON_FLAGS" \
+               CC="$CLANG" \
+               STRIP="$STRIP" \
+               AR="$AR" \
+               RANLIB="$RANLIB" \
                -j"$(nproc)"
 
           # 验证产物
@@ -340,12 +349,12 @@ jobs:
           ls -la busybox
 
           # 二次 strip 瘦身
-          "$NDK_BIN/llvm-strip" busybox
+          "$STRIP" busybox
           mv busybox "busybox-${{ matrix.arch }}"
           ls -la "busybox-${{ matrix.arch }}"
 
       - name: 上传构建产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: busybox-${{ matrix.arch }}
           path: busybox/busybox-${{ matrix.arch }}
@@ -359,12 +368,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0   # 推送 tag 需要历史,否则 softprops 可能推不上去
 
       - name: 下载所有构建产物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -389,7 +398,7 @@ jobs:
           ls -la
 
       - name: 创建 GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             release/busybox-ndk-all-arch-${{ needs.check-version.outputs.latest-version }}.tar.gz
