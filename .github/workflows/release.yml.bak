@@ -216,22 +216,18 @@ jobs:
         run: |
           cd busybox
           # osm0sis 的补丁,解决 BusyBox 与 Android Bionic libc 的兼容性问题
-          # 注意:osm0sis/android-busybox-ndk 现在 master 分支里没有 build.sh 了,
-          # 但 patches/ 目录还在,我们只要里面的 patch 文件
           if wget -qO- https://github.com/osm0sis/android-busybox-ndk/archive/refs/heads/master.tar.gz | tar xz; then
+            # 复制所有 patch 文件
             if [ -d android-busybox-ndk-master/patches ]; then
-              echo "找到 patches 目录,逐个应用"
-              for patch in android-busybox-ndk-master/patches/*.patch; do
-                if [ -e "$patch" ]; then
-                  echo "应用补丁: $(basename "$patch")"
-                  # -N 跳过已应用的,避免一个 patch 失败导致整个 job 挂掉
-                  patch -p1 -N < "$patch" || echo "  (已应用或部分冲突,继续)"
-                fi
-              done
-            else
-              echo "警告:下载到 master 但没有 patches 目录,内容如下:"
-              ls android-busybox-ndk-master/ | head -20
+              cp android-busybox-ndk-master/patches/* . 2>/dev/null || true
             fi
+            for patch in patches/*.patch; do
+              if [ -e "$patch" ]; then
+                echo "应用补丁: $patch"
+                # -N 跳过已应用的,避免一个 patch 失败导致整个 job 挂掉
+                patch -p1 -N < "$patch" || echo "  (已应用或部分冲突,继续)"
+              fi
+            done
           else
             echo "警告:补丁下载失败,继续裸编译"
           fi
@@ -245,7 +241,7 @@ jobs:
 
           # 调试用:把 bin 目录里所有 clang 相关的都列出来
           echo "=== bin 目录里的 clang 相关文件 ==="
-          ls "$NDK_BIN" 2>/dev/null | grep -i clang | head -20
+          ls "$NDK_BIN" 2>/dev/null | grep -i clang || echo "(无)"
 
           # 找到真实的 clang 二进制 (排除 -clang 后缀的 wrapper 脚本和 clang++)
           # 优先级:clang (无后缀) > clang-XX > clang-N
@@ -274,17 +270,6 @@ jobs:
             exit 1
           fi
 
-          # 验证目标架构的 asm 头目录存在 (否则 NDK 包有问题)
-          ARCH_DIR="$SYSROOT/usr/include/${{ matrix.clang_triple }}"
-          if [ ! -d "$ARCH_DIR/asm" ]; then
-            echo "::error::目标架构 asm 头目录不存在: $ARCH_DIR/asm"
-            echo "NDK 包可能下载不完整,目录内容:"
-            ls "$SYSROOT/usr/include/" 2>/dev/null | head -10
-            exit 1
-          fi
-          echo "目标 asm 头目录 OK: $ARCH_DIR/asm"
-          ls "$ARCH_DIR/asm/" 2>/dev/null | head -5
-
           {
             echo "clang=$CLANG_PATH"
             echo "sysroot=$SYSROOT"
@@ -300,21 +285,17 @@ jobs:
         run: |
           cd busybox
 
-          # 【关键修复】把 --target= 和 --sysroot= 都塞进 CC/CFLAGS/LDFLAGS。
-          # 之前用的 CLANG_TRIPLE 这个变量 BusyBox 根本不识别 (BusyBox 根 Makefile 里
-          # 没有这个变量,CC 默认是 $(CROSS_COMPILE)gcc)。我们直接绕过这个变量,
-          # 用 --target= 让 clang 知道目标架构,这样 NDK 的 linux/types.h 才能
-          # 正确解析到 <arch>-linux-android/asm/types.h。
-          TARGET="${{ matrix.clang_triple }}${{ matrix.api }}"
-          COMMON_FLAGS="--target=$TARGET --sysroot=$SYSROOT"
-
+          # CLANG_TRIPLE 是 BusyBox 专为 Android clang 提供的 make 变量
+          # 它会让 CC 变成 "clang --target=<triple><api> --sysroot=..."
+          # 不要再用 NDK 里的 xxx-linux-android21-clang 包装脚本
           make ARCH=${{ matrix.make_arch }} \
-               CC="$CLANG $COMMON_FLAGS" \
+               CC="$CLANG" \
+               CLANG_TRIPLE="${{ matrix.clang_triple }}${{ matrix.api }}" \
                STRIP="$NDK_BIN/llvm-strip" \
                AR="$NDK_BIN/llvm-ar" \
                RANLIB="$NDK_BIN/llvm-ranlib" \
-               CFLAGS="$COMMON_FLAGS" \
-               LDFLAGS="$COMMON_FLAGS" \
+               CFLAGS="--sysroot=$SYSROOT" \
+               LDFLAGS="--sysroot=$SYSROOT" \
                defconfig
 
           # 静态编译:让 binary 独立运行
@@ -325,14 +306,15 @@ jobs:
           # 关掉 crosstool/NDK 容易炸的 selinux/namespace 相关选项
           sed -i 's|CONFIG_FEATURE_NSLOOKUP=y|# CONFIG_FEATURE_NSLOOKUP is not set|' .config || true
 
-          # 编译
+          # 关键:make 编译时同样要传 CLANG_TRIPLE,否则会退回到 host 编译
           make ARCH=${{ matrix.make_arch }} \
-               CC="$CLANG $COMMON_FLAGS" \
+               CC="$CLANG" \
+               CLANG_TRIPLE="${{ matrix.clang_triple }}${{ matrix.api }}" \
                STRIP="$NDK_BIN/llvm-strip" \
                AR="$NDK_BIN/llvm-ar" \
                RANLIB="$NDK_BIN/llvm-ranlib" \
-               CFLAGS="$COMMON_FLAGS" \
-               LDFLAGS="$COMMON_FLAGS" \
+               CFLAGS="--sysroot=$SYSROOT" \
+               LDFLAGS="--sysroot=$SYSROOT" \
                -j"$(nproc)"
 
           # 验证产物
