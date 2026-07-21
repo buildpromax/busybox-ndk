@@ -68,22 +68,22 @@ jobs:
       matrix:
         include:
           - arch: arm
-            ndk-version: r29
+            ndk-version: r28b
             clang_triple: armv7a-linux-androideabi
             make_arch: arm
             api: 21
           - arch: arm64
-            ndk-version: r29
+            ndk-version: r28b
             clang_triple: aarch64-linux-android
             make_arch: arm64
             api: 21
           - arch: x86
-            ndk-version: r29
+            ndk-version: r28b
             clang_triple: i686-linux-android
             make_arch: x86
             api: 21
           - arch: x86_64
-            ndk-version: r29
+            ndk-version: r28b
             clang_triple: x86_64-linux-android
             make_arch: x86_64
             api: 21
@@ -240,16 +240,35 @@ jobs:
           echo "找到 NDK clang: $CLANG_REAL"
           "$CLANG_REAL" --version
 
-          # 2. 【关键】NDK r29 bin 目录里只有 clang-21,没有裸 clang。
-          #    NDK 自带的 <triple>-clang wrapper 内部 exec 裸 clang,找不到就 exit 127。
-          #    我们直接创建软链: clang -> clang-21,让 wrapper 能正常 exec。
+          # 2. 【关键】NDK r29 bin 目录里虽然有 'clang' 这个文件名(可能是
+          #    setup-ndk 缓存里残留的空文件,或者 wrapper stub),但它要么
+          #    不可执行,要么指向不存在的东西。
+          #    真正的 clang 是带版本号的 clang-21。
+          #    NDK 自带的 <triple>-clang wrapper 内部 exec 裸 clang,
+          #    找不到有效 clang 就 exit 127。
+          #    我们 force 创建软链: clang -> clang-21,让 wrapper 能正常 exec。
           REAL_CLANG_NAME=$(basename "$CLANG_REAL")
           CLANG_BARE="$NDK_BIN/${REAL_CLANG_NAME%-[0-9]*}"
-          if [ ! -e "$CLANG_BARE" ]; then
-            echo "创建裸 clang 软链: $CLANG_BARE -> $REAL_CLANG_NAME"
-            ln -s "$REAL_CLANG_NAME" "$CLANG_BARE"
+
+          # 先看现有 clang 是什么状态
+          if [ -e "$CLANG_BARE" ] || [ -L "$CLANG_BARE" ]; then
+            if [ -L "$CLANG_BARE" ]; then
+              CURRENT_TARGET=$(readlink "$CLANG_BARE")
+              echo "现有 clang 是软链,指向: $CURRENT_TARGET"
+            elif [ -x "$CLANG_BARE" ]; then
+              echo "现有 clang 是可执行文件,类型: $(file -b "$CLANG_BARE")"
+            else
+              echo "现有 clang 存在但不可执行,类型: $(file -b "$CLANG_BARE")"
+            fi
           fi
+
+          # 不管现有 clang 是什么,都强制重建软链,确保指向 clang-21
+          echo "创建/重建裸 clang 软链: $CLANG_BARE -> $REAL_CLANG_NAME"
+          rm -f "$CLANG_BARE"
+          ln -s "$REAL_CLANG_NAME" "$CLANG_BARE"
           echo "CLANG(裸) = $CLANG_BARE -> $(readlink -f "$CLANG_BARE")"
+          # 验证软链可用
+          "$CLANG_BARE" --version | head -1
 
           # 3. 找 lld (NDK 22+ 默认 -fuse-ld=lld)
           LLD_PATH="$NDK_BIN/ld.lld"
