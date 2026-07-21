@@ -68,22 +68,22 @@ jobs:
       matrix:
         include:
           - arch: arm
-            ndk-version: r28b
+            ndk-version: r29
             clang_triple: armv7a-linux-androideabi
             make_arch: arm
             api: 21
           - arch: arm64
-            ndk-version: r28b
+            ndk-version: r29
             clang_triple: aarch64-linux-android
             make_arch: arm64
             api: 21
           - arch: x86
-            ndk-version: r28b
+            ndk-version: r29
             clang_triple: i686-linux-android
             make_arch: x86
             api: 21
           - arch: x86_64
-            ndk-version: r28b
+            ndk-version: r29
             clang_triple: x86_64-linux-android
             make_arch: x86_64
             api: 21
@@ -250,19 +250,7 @@ jobs:
           REAL_CLANG_NAME=$(basename "$CLANG_REAL")
           CLANG_BARE="$NDK_BIN/${REAL_CLANG_NAME%-[0-9]*}"
 
-          # 先看现有 clang 是什么状态
-          if [ -e "$CLANG_BARE" ] || [ -L "$CLANG_BARE" ]; then
-            if [ -L "$CLANG_BARE" ]; then
-              CURRENT_TARGET=$(readlink "$CLANG_BARE")
-              echo "现有 clang 是软链,指向: $CURRENT_TARGET"
-            elif [ -x "$CLANG_BARE" ]; then
-              echo "现有 clang 是可执行文件,类型: $(file -b "$CLANG_BARE")"
-            else
-              echo "现有 clang 存在但不可执行,类型: $(file -b "$CLANG_BARE")"
-            fi
-          fi
-
-          # 不管现有 clang 是什么,都强制重建软链,确保指向 clang-21
+          # 不管现有 clang 是什么,都强制重建软链,确保指向真 clang
           echo "创建/重建裸 clang 软链: $CLANG_BARE -> $REAL_CLANG_NAME"
           rm -f "$CLANG_BARE"
           ln -s "$REAL_CLANG_NAME" "$CLANG_BARE"
@@ -341,28 +329,35 @@ jobs:
         run: |
           cd busybox
 
-          # 用 NDK wrapper 编译。
-          # wrapper(<triple><api>-clang) -> 软链 clang -> 真 clang-21
-          # 同时用 -B 让 wrapper 内的 clang 在 bin 目录找 ld.lld
-          NDK_BIN_DIR=$(dirname "$LLD")
+          # 【关键】用 BusyBox 官方的 android_502_defconfig,而不是 defconfig。
+          # defconfig 会启用 tc / i2c / modutils / mountpoint 等一堆
+          # 跟 Android NDK bionic libc 不兼容的 applet(需要 linux/pkt_sched.h
+          # 里的 TCA_CBQ_* 常量、linux/i2c-dev.h 头文件等等,这些 NDK 都没有)。
+          # android_502_defconfig 是官方专门为 Android 5.0.2 + NDK API 21 调过的,
+          # 已经把所有不兼容的选项都关掉了。
           make ARCH=${{ matrix.make_arch }} \
-               CC="$CLANG -B$NDK_BIN_DIR" \
+               CC="$CLANG -B$(dirname "$LLD")" \
                STRIP="$STRIP" \
                AR="$AR" \
                RANLIB="$RANLIB" \
-               defconfig
+               android_502_defconfig
 
-          # 静态编译:让 binary 独立运行
+          # 静态编译:让 binary 独立运行(android_502_defconfig 注释里说"static
+          # did not work"是 NDK 早期的问题,NDK r28/r29 的 libc.a + libm.a
+          # 都能正常静态链接,实测可以)
           sed -i 's|# CONFIG_STATIC is not set|CONFIG_STATIC=y|' .config
-          # 关掉 Android 上有问题的特性
-          sed -i 's|CONFIG_FEATURE_WTMP=y|# CONFIG_FEATURE_WTMP is not set|' .config
-          sed -i 's|CONFIG_FEATURE_UTMP=y|# CONFIG_FEATURE_UTMP is not set|' .config
-          # 关掉 crosstool/NDK 容易炸的 selinux/namespace 相关选项
-          sed -i 's|CONFIG_FEATURE_NSLOOKUP=y|# CONFIG_FEATURE_NSLOOKUP is not set|' .config || true
+
+          # android_502_defconfig 默认不打开一些 Android 上好用的特性,
+          # 我们手动开几个:
+          #   - CONFIG_TASKSET (多核 CPU 亲和性)
+          #   - CONFIG_FEATURE_TOP_CPU_USAGE_PERCENTAGE (top 看到 CPU%)
+          # 这些都比较安全。
+          sed -i 's|# CONFIG_TASKSET is not set|CONFIG_TASKSET=y|' .config || true
+          sed -i 's|# CONFIG_FEATURE_TOP_CPU_USAGE_PERCENTAGE is not set|CONFIG_FEATURE_TOP_CPU_USAGE_PERCENTAGE=y|' .config || true
 
           # 编译
           make ARCH=${{ matrix.make_arch }} \
-               CC="$CLANG -B$NDK_BIN_DIR" \
+               CC="$CLANG -B$(dirname "$LLD")" \
                STRIP="$STRIP" \
                AR="$AR" \
                RANLIB="$RANLIB" \
@@ -433,6 +428,9 @@ jobs:
             ## BusyBox NDK 多架构二进制
 
             版本: `${{ needs.check-version.outputs.latest-version }}`
+
+            使用 BusyBox 官方的 `android_502_defconfig` 编译(为 Android NDK 调整过,
+            关掉了与 Bionic libc 不兼容的 applet,如 tc、i2cdetect 等)。
 
             包含架构:
             - ARM (armv7a) — NDK r29
