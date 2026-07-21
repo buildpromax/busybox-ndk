@@ -212,54 +212,56 @@ jobs:
           echo "---"
           grep -E '^VERSION' busybox/Makefile | head -3 || true
 
-      - name: 应用 Android NDK 兼容补丁
-        run: |
-          cd busybox
-          # osm0sis 的补丁,解决 BusyBox 与 Android Bionic libc 的兼容性问题
-          if wget -qO- https://github.com/osm0sis/android-busybox-ndk/archive/refs/heads/master.tar.gz | tar xz; then
-            if [ -d android-busybox-ndk-master/patches ]; then
-              echo "找到 patches 目录,逐个应用"
-              for patch in android-busybox-ndk-master/patches/*.patch; do
-                if [ -e "$patch" ]; then
-                  echo "应用补丁: $(basename "$patch")"
-                  # -N 跳过已应用的,避免一个 patch 失败导致整个 job 挂掉
-                  patch -p1 -N < "$patch" || echo "  (已应用或部分冲突,继续)"
-                fi
-              done
-            else
-              echo "警告:下载到 master 但没有 patches 目录,内容如下:"
-              ls android-busybox-ndk-master/ | head -20
-            fi
-          else
-            echo "警告:补丁下载失败,继续裸编译"
-          fi
-
-      - name: 探测 NDK 工具链
+      - name: 探测并补全 NDK 工具链
         id: probe-clang
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          # 【关键】用 NDK 自带的 wrapper 而不是裸 clang。
-          # NDK 在 bin 目录下提供了 <triple><api>-clang 这样的包装脚本,
-          # 它们内部已经正确设置好 --target= --sysroot= -fuse-ld=lld 等所有
-          # Android 编译需要的参数。直接用它们就行,不要再自己拼参数。
-          TRIPLE="${{ matrix.clang_triple }}${{ matrix.api }}"
-          CLANG_WRAPPER="$NDK_BIN/${TRIPLE}-clang"
-
-          if [ ! -x "$CLANG_WRAPPER" ]; then
-            echo "::error::找不到 NDK wrapper: $CLANG_WRAPPER"
-            echo "bin 目录里 -clang 结尾的文件:"
-            ls "$NDK_BIN" 2>/dev/null | grep '\-clang$' | head -20
+          # 1. 找到真实的 clang 二进制 (有版本号后缀的才是真二进制)
+          CLANG_REAL=""
+          for cand in clang-21 clang-20 clang-19 clang-18 clang-17 clang-15; do
+            if [ -x "$NDK_BIN/$cand" ] && [ ! -L "$NDK_BIN/$cand" ]; then
+              CLANG_REAL="$NDK_BIN/$cand"
+              break
+            fi
+          done
+          if [ -z "$CLANG_REAL" ]; then
+            if [ -x "$NDK_BIN/clang" ]; then
+              CLANG_REAL="$NDK_BIN/clang"
+            fi
+          fi
+          if [ -z "$CLANG_REAL" ]; then
+            echo "::error::找不到 NDK clang 真实二进制"
+            ls "$NDK_BIN" 2>/dev/null | head -20
             exit 1
           fi
+          echo "找到 NDK clang: $CLANG_REAL"
+          "$CLANG_REAL" --version
 
-          echo "找到 NDK wrapper: $CLANG_WRAPPER"
-          "$CLANG_WRAPPER" --version
+          # 2. 【关键】NDK r29 bin 目录里只有 clang-21,没有裸 clang。
+          #    NDK 自带的 <triple>-clang wrapper 内部 exec 裸 clang,找不到就 exit 127。
+          #    我们直接创建软链: clang -> clang-21,让 wrapper 能正常 exec。
+          REAL_CLANG_NAME=$(basename "$CLANG_REAL")
+          CLANG_BARE="$NDK_BIN/${REAL_CLANG_NAME%-[0-9]*}"
+          if [ ! -e "$CLANG_BARE" ]; then
+            echo "创建裸 clang 软链: $CLANG_BARE -> $REAL_CLANG_NAME"
+            ln -s "$REAL_CLANG_NAME" "$CLANG_BARE"
+          fi
+          echo "CLANG(裸) = $CLANG_BARE -> $(readlink -f "$CLANG_BARE")"
 
-          # 找 strip/ar/ranlib (NDK r29 这些工具改叫 llvm-strip / llvm-ar / llvm-ranlib
-          # 但 NDK 内部还可能放别处,做一次发现)
+          # 3. 找 lld (NDK 22+ 默认 -fuse-ld=lld)
+          LLD_PATH="$NDK_BIN/ld.lld"
+          if [ ! -x "$LLD_PATH" ]; then
+            echo "::error::找不到 ld.lld: $LLD_PATH"
+            echo "bin 目录里 lld 相关的:"
+            ls "$NDK_BIN" 2>/dev/null | grep -i lld
+            exit 1
+          fi
+          echo "找到 ld.lld: $LLD_PATH"
+
+          # 4. 找 strip/ar/ranlib
           STRIP_BIN=""
           for cand in llvm-strip strip; do
             if [ -x "$NDK_BIN/$cand" ]; then
@@ -294,35 +296,38 @@ jobs:
             exit 1
           fi
 
-          echo "工具链 OK: $CLANG_WRAPPER / $STRIP_BIN / $AR_BIN / $RANLIB_BIN"
+          echo "工具链 OK:"
+          echo "  CLANG = $CLANG_BARE"
+          echo "  LLD   = $LLD_PATH"
+          echo "  STRIP = $STRIP_BIN"
+          echo "  AR    = $AR_BIN"
+          echo "  RANLIB= $RANLIB_BIN"
 
           {
-            echo "clang=$CLANG_WRAPPER"
+            echo "clang=$CLANG_BARE"
+            echo "lld=$LLD_PATH"
             echo "strip=$STRIP_BIN"
             echo "ar=$AR_BIN"
             echo "ranlib=$RANLIB_BIN"
-            echo "ndk_bin=$NDK_BIN"
           } >> "$GITHUB_OUTPUT"
 
       - name: 配置与编译
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           CLANG: ${{ steps.probe-clang.outputs.clang }}
+          LLD: ${{ steps.probe-clang.outputs.lld }}
           STRIP: ${{ steps.probe-clang.outputs.strip }}
           AR: ${{ steps.probe-clang.outputs.ar }}
           RANLIB: ${{ steps.probe-clang.outputs.ranlib }}
         run: |
           cd busybox
 
-          # 【关键修复】用 NDK 自己的 wrapper 替换裸 clang。
-          # wrapper = <triple><api>-clang,它内部已经处理好了所有 Android 编译需要的参数:
-          #   --target=<triple><api>
-          #   --sysroot=<NDK>/sysroot
-          #   -fuse-ld=lld (并知道 ld.lld 在哪)
-          # 之前手动传 --target= --sysroot= 时漏了 -fuse-ld,导致链接器找不到 ld.lld。
-          # 用 wrapper 就一劳永逸。
+          # 用 NDK wrapper 编译。
+          # wrapper(<triple><api>-clang) -> 软链 clang -> 真 clang-21
+          # 同时用 -B 让 wrapper 内的 clang 在 bin 目录找 ld.lld
+          NDK_BIN_DIR=$(dirname "$LLD")
           make ARCH=${{ matrix.make_arch }} \
-               CC="$CLANG" \
+               CC="$CLANG -B$NDK_BIN_DIR" \
                STRIP="$STRIP" \
                AR="$AR" \
                RANLIB="$RANLIB" \
@@ -338,7 +343,7 @@ jobs:
 
           # 编译
           make ARCH=${{ matrix.make_arch }} \
-               CC="$CLANG" \
+               CC="$CLANG -B$NDK_BIN_DIR" \
                STRIP="$STRIP" \
                AR="$AR" \
                RANLIB="$RANLIB" \
