@@ -100,7 +100,8 @@ jobs:
         with:
           ndk-version: ${{ matrix.ndk-version }}
           add-to-path: false
-          local-cache: true
+          # 不用 local-cache: 缓存往返会丢失可执行权限 (实测 ld.lld 存在但不可执行)
+          # 甚至损坏 clang 软链, 每次从 Google 全新下载更可靠 (CI 网速下仅几十秒)
 
       - name: 安装编译依赖
         run: |
@@ -205,6 +206,9 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          # 【防御】缓存/解包可能丢失执行权限, 先统一补上
+          chmod +x "$NDK_BIN"/* 2>/dev/null || true
 
           # 1. 找到真实的 clang 二进制 (有版本号后缀的才是真二进制)
           CLANG_REAL=""
