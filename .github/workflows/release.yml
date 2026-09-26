@@ -14,6 +14,7 @@ jobs:
   check-version:
     name: 检查最新版本
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       latest-version: ${{ steps.check.outputs.latest-version }}
       skip: ${{ steps.check.outputs.skip }}
@@ -41,8 +42,8 @@ jobs:
 
           # 最后兜底:硬编码一个近期稳定版,避免完全失败
           if [ -z "$LATEST_VERSION" ]; then
-            echo "全部探测失败,使用硬编码版本 1_37_0"
-            LATEST_VERSION="1_37_0"
+            echo "全部探测失败,使用硬编码版本 1_38_0"
+            LATEST_VERSION="1_38_0"
           fi
 
           echo "最新版本: $LATEST_VERSION"
@@ -62,6 +63,7 @@ jobs:
     needs: check-version
     if: needs.check-version.outputs.skip == 'false'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     strategy:
       fail-fast: false
@@ -71,33 +73,22 @@ jobs:
             ndk-version: r29
             clang_triple: armv7a-linux-androideabi
             make_arch: arm
-            api: 21
           - arch: arm64
             ndk-version: r29
             clang_triple: aarch64-linux-android
             make_arch: arm64
-            api: 21
           - arch: x86
             ndk-version: r29
             clang_triple: i686-linux-android
             make_arch: x86
-            api: 21
           - arch: x86_64
             ndk-version: r29
             clang_triple: x86_64-linux-android
             make_arch: x86_64
-            api: 21
-          # MIPS 架构:NDK r24+ 已彻底移除,固定使用 r23c
-          - arch: mips
-            ndk-version: r23c
-            clang_triple: mipsel-linux-android
-            make_arch: mips
-            api: 21
-          - arch: mips64
-            ndk-version: r23c
-            clang_triple: mips64el-linux-android
-            make_arch: mips
-            api: 21
+        # 注意: 不再包含 MIPS/mips64。
+        # NDK r18 (2018年) 起就彻底移除了 MIPS 工具链,任何现代 NDK 都无法编译 MIPS,
+        # 旧配置里"用 r23c 编译 MIPS"的注释是错误的 (r23c 同样没有 mips target)。
+        # 且 MIPS Android 设备早已绝迹,维持这两个矩阵项只会让定时任务周周报错。
 
     steps:
       - name: 检出仓库
@@ -193,8 +184,6 @@ jobs:
           fi
 
           # 验证源码目录就位
-          # busybox.c 在 1.36+ 已经被移走了 (入口改成 libbb/appletlib.c 里的 main),
-          # 不能再用 busybox.c 当存在性标志。改用 Makefile + applets/ + libbb/ 三个标志位
           if [ ! -f busybox/Makefile ]; then
             echo "::error::源码不完整,Makefile 缺失"
             ls -la busybox/ 2>/dev/null | head -20
@@ -208,8 +197,6 @@ jobs:
           fi
 
           echo "源码就位: Makefile + applets/ + libbb/ 都存在"
-          head -5 busybox/Makefile
-          echo "---"
           grep -E '^VERSION' busybox/Makefile | head -3 || true
 
       - name: 探测并补全 NDK 工具链
@@ -238,23 +225,18 @@ jobs:
             exit 1
           fi
           echo "找到 NDK clang: $CLANG_REAL"
-          "$CLANG_REAL" --version
+          "$CLANG_REAL" --version | head -1
 
-          # 2. 【关键】NDK r29 bin 目录里虽然有 'clang' 这个文件名(可能是
-          #    setup-ndk 缓存里残留的空文件,或者 wrapper stub),但它要么
-          #    不可执行,要么指向不存在的东西。
-          #    真正的 clang 是带版本号的 clang-21。
+          # 2. setup-ndk 的缓存可能把 clang 软链弄坏 (空文件或指向不存在的东西)。
           #    NDK 自带的 <triple>-clang wrapper 内部 exec 裸 clang,
           #    找不到有效 clang 就 exit 127。
-          #    我们 force 创建软链: clang -> clang-21,让 wrapper 能正常 exec。
+          #    强制重建软链: clang -> clang-XX,让 wrapper 和裸调用都能正常工作。
           REAL_CLANG_NAME=$(basename "$CLANG_REAL")
           CLANG_BARE="$NDK_BIN/${REAL_CLANG_NAME%-[0-9]*}"
 
-          # 不管现有 clang 是什么,都强制重建软链,确保指向真 clang
           echo "创建/重建裸 clang 软链: $CLANG_BARE -> $REAL_CLANG_NAME"
           rm -f "$CLANG_BARE"
           ln -s "$REAL_CLANG_NAME" "$CLANG_BARE"
-          echo "CLANG(裸) = $CLANG_BARE -> $(readlink -f "$CLANG_BARE")"
           # 验证软链可用
           "$CLANG_BARE" --version | head -1
 
@@ -262,7 +244,6 @@ jobs:
           LLD_PATH="$NDK_BIN/ld.lld"
           if [ ! -x "$LLD_PATH" ]; then
             echo "::error::找不到 ld.lld: $LLD_PATH"
-            echo "bin 目录里 lld 相关的:"
             ls "$NDK_BIN" 2>/dev/null | grep -i lld
             exit 1
           fi
@@ -298,8 +279,6 @@ jobs:
             echo "  STRIP=$STRIP_BIN"
             echo "  AR=$AR_BIN"
             echo "  RANLIB=$RANLIB_BIN"
-            echo "bin 目录里 strip/ar/ranlib 相关的:"
-            ls "$NDK_BIN" 2>/dev/null | grep -E 'strip|ar$|ranlib'
             exit 1
           fi
 
@@ -329,35 +308,63 @@ jobs:
         run: |
           cd busybox
 
-          # 【关键】用 BusyBox 官方的 android_502_defconfig,而不是 defconfig。
-          # defconfig 会启用 tc / i2c / modutils / mountpoint 等一堆
-          # 跟 Android NDK bionic libc 不兼容的 applet(需要 linux/pkt_sched.h
-          # 里的 TCA_CBQ_* 常量、linux/i2c-dev.h 头文件等等,这些 NDK 都没有)。
-          # android_502_defconfig 是官方专门为 Android 5.0.2 + NDK API 21 调过的,
-          # 已经把所有不兼容的选项都关掉了。
+          # 【关键1】显式 --target 和 --sysroot。
+          # 旧版工作流用裸 clang 当 CC,没有 target 参数,实际是拿宿主机 glibc
+          # 在编译,产物架构是错的。必须带上 Android triple 和 NDK sysroot。
+          API=24
+          SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          CC="$CLANG --target=${{ matrix.clang_triple }}${API} --sysroot=$SYSROOT -B$(dirname "$LLD")"
+          echo "CC = $CC"
+
+          # 用 BusyBox 官方的 android_502_defconfig (为 Android 调过,
+          # 已关掉大量与 Bionic libc 不兼容的老 applet)。
           make ARCH=${{ matrix.make_arch }} \
-               CC="$CLANG -B$(dirname "$LLD")" \
+               CC="$CC" \
                STRIP="$STRIP" \
                AR="$AR" \
                RANLIB="$RANLIB" \
                android_502_defconfig
 
-          # 静态编译:让 binary 独立运行(android_502_defconfig 注释里说"static
-          # did not work"是 NDK 早期的问题,NDK r28/r29 的 libc.a + libm.a
-          # 都能正常静态链接,实测可以)
-          sed -i 's|# CONFIG_STATIC is not set|CONFIG_STATIC=y|' .config
+          # 【关键2】NEW 符号黑名单。
+          # android_502_defconfig 是老版本 busybox 时代写的,新版本 busybox
+          # 新增的 kconfig 符号在 defconfig 里没有对应行,会被默认开启 (=y)。
+          # 以下符号在 NDK/bionic 下编译或链接必炸,逐一显式关闭:
+          sed -i 's|^CONFIG_TC=y$|# CONFIG_TC is not set|' .config
+          sed -i 's|^CONFIG_USE_BB_CRYPT_YES=y$|# CONFIG_USE_BB_CRYPT_YES is not set|' .config
+          sed -i 's|^CONFIG_FEATURE_SU_CHECKS_SHELLS=y$|# CONFIG_FEATURE_SU_CHECKS_SHELLS is not set|' .config
+          sed -i 's|^CONFIG_ADJTIMEX=y$|# CONFIG_ADJTIMEX is not set|' .config
+          sed -i 's|^CONFIG_SEEDRNG=y$|# CONFIG_SEEDRNG is not set|' .config
+          sed -i 's|^CONFIG_MOUNT=y$|# CONFIG_MOUNT is not set|' .config
+          sed -i 's|^CONFIG_SWAPON=y$|# CONFIG_SWAPON is not set|' .config
+          sed -i 's|^CONFIG_SWAPOFF=y$|# CONFIG_SWAPOFF is not set|' .config
+          # 结清依赖,让被禁 applet 的子特性自动归位
+          yes '' | make ARCH=${{ matrix.make_arch }} oldconfig
 
-          # android_502_defconfig 默认不打开一些 Android 上好用的特性,
-          # 我们手动开几个:
-          #   - CONFIG_TASKSET (多核 CPU 亲和性)
-          #   - CONFIG_FEATURE_TOP_CPU_USAGE_PERCENTAGE (top 看到 CPU%)
-          # 这些都比较安全。
-          sed -i 's|# CONFIG_TASKSET is not set|CONFIG_TASKSET=y|' .config || true
-          sed -i 's|# CONFIG_FEATURE_TOP_CPU_USAGE_PERCENTAGE is not set|CONFIG_FEATURE_TOP_CPU_USAGE_PERCENTAGE=y|' .config || true
+          # 静态编译: NDK 的 libc.a 放在 sysroot/usr/lib/<arch>/ 无版本号目录,
+          # clang 驱动能自动找到,实测 r29 + API 24 可以正常静态链接
+          sed -i 's|^# CONFIG_STATIC is not set$|CONFIG_STATIC=y|' .config
+
+          # defconfig 的 EXTRA_LDLIBS="log" 需要静态 liblog.a,NDK 不提供;
+          # busybox 源码没有直接调用 __android_log,syslog 走 bionic libc,清空安全
+          sed -i 's|^CONFIG_EXTRA_LDLIBS=.*$|CONFIG_EXTRA_LDLIBS=""|' .config
+
+          # 静态链接时 busybox 的 android 兼容垫片 (getsid/adjtimex/sethostname/
+          # strchrnul 等) 与 r29 libc.a 里的同名符号重复定义,
+          # 允许多重定义 (busybox 自己的版本先生效,语义一致)
+          sed -i 's|^CONFIG_EXTRA_LDFLAGS=.*$|CONFIG_EXTRA_LDFLAGS="-Wl,--allow-multiple-definition"|' .config
+
+          # x86-32 专属: FAST_FUNC(regparm/stdcall) 与 bionic 头文件声明冲突
+          # (如 strchrnul 在 API 23+ 已有声明),busybox 上游预留了禁用选项
+          if [ "${{ matrix.arch }}" = "x86" ]; then
+            sed -i 's|^CONFIG_EXTRA_CFLAGS=.*$|CONFIG_EXTRA_CFLAGS="-DFAST_FUNC="|' .config
+          fi
+
+          # Android 上好用的特性兜底
+          sed -i 's|^# CONFIG_TASKSET is not set$|CONFIG_TASKSET=y|' .config
 
           # 编译
           make ARCH=${{ matrix.make_arch }} \
-               CC="$CLANG -B$(dirname "$LLD")" \
+               CC="$CC" \
                STRIP="$STRIP" \
                AR="$AR" \
                RANLIB="$RANLIB" \
@@ -371,6 +378,7 @@ jobs:
           "$STRIP" busybox
           mv busybox "busybox-${{ matrix.arch }}"
           ls -la "busybox-${{ matrix.arch }}"
+          file "busybox-${{ matrix.arch }}"
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v7
@@ -381,15 +389,19 @@ jobs:
           compression-level: 9
 
   # Job 3: 汇总并发布 Release
+  # 注意: 只要 arm/arm64 两个关键架构成功就发布 (x86 失败不阻塞),
+  # 避免单一架构故障导致整个工作流永远发不出 Release
   release:
     name: 汇总并发布
-    needs: build
+    needs: [check-version, build]
+    if: ${{ !cancelled() && needs.check-version.outputs.skip == 'false' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: 检出仓库
         uses: actions/checkout@v7
         with:
-          fetch-depth: 0   # 推送 tag 需要历史,否则 softprops 可能推不上去
+          fetch-depth: 0   # 推送 tag 需要历史
 
       - name: 下载所有构建产物
         uses: actions/download-artifact@v8
@@ -398,23 +410,32 @@ jobs:
           merge-multiple: true
 
       - name: 验证产物并生成 SHA256
+        id: prepare
         run: |
           mkdir -p release
           cd artifacts
-          # 检查每个架构都有产物
-          for arch in arm arm64 x86 x86_64 mips mips64; do
+          ls -la
+
+          # 硬性要求: arm + arm64 必须成功 (Android 最主流的两个架构)
+          for arch in arm arm64; do
             if [ ! -f "busybox-$arch" ]; then
-              echo "::error::缺少 busybox-$arch 产物"
+              echo "::error::关键产物 busybox-$arch 缺失,放弃发布"
               exit 1
             fi
             file "busybox-$arch"
           done
+
+          # 其余架构有多少收多少
           cp busybox-* ../release/
           cd ../release
           sha256sum busybox-* > SHA256SUMS
           cat SHA256SUMS
           tar -czf "busybox-ndk-all-arch-${{ needs.check-version.outputs.latest-version }}.tar.gz" busybox-*
           ls -la
+
+          # 生成实际包含的架构列表,写进 Release 说明
+          ARCH_LIST=$(ls busybox-* | sed 's/busybox-//' | tr '\n' ',' | sed 's/,$//;s/,/, /g')
+          echo "arch-list=$ARCH_LIST" >> "$GITHUB_OUTPUT"
 
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v3
@@ -425,27 +446,34 @@ jobs:
           tag_name: busybox-${{ needs.check-version.outputs.latest-version }}
           name: "BusyBox NDK ${{ needs.check-version.outputs.latest-version }}"
           body: |
-            ## BusyBox NDK 多架构二进制
+            ## BusyBox NDK 多架构静态二进制
 
             版本: `${{ needs.check-version.outputs.latest-version }}`
 
-            使用 BusyBox 官方的 `android_502_defconfig` 编译(为 Android NDK 调整过,
-            关掉了与 Bionic libc 不兼容的 applet,如 tc、i2cdetect 等)。
+            包含架构: ${{ steps.prepare.outputs.arch-list }}
 
-            包含架构:
-            - ARM (armv7a) — NDK r29
-            - ARM64 (aarch64) — NDK r29
-            - x86 (i686) — NDK r29
-            - x86_64 — NDK r29
-            - MIPS (mipsel) — NDK r23c
-            - MIPS64 (mips64el) — NDK r23c
+            ## 构建参数
 
-            API 等级: 21 (Android 5.0 Lollipop)
+            - NDK r29, Clang 21, API 等级 **24 (Android 7.0+)**
+            - 完全静态链接,不依赖任何系统 so,任何 Android 7.0+ 设备可直接运行
+            - 基于 BusyBox 官方 `android_502_defconfig` 配置
+
+            ## 针对现代 NDK 的配置调整
+
+            以下 applet 在 NDK/bionic 下无法编译或没有意义,已显式关闭:
+
+            | Applet | 原因 |
+            |--------|------|
+            | tc | 需要内核 TCA_CBQ_* 常量,新内核 uapi 已删除,bionic 没有 |
+            | mount / swapon / swapoff | bionic mntent.h 缺少 addmntent/hasmntopt |
+            | adjtimex | busybox 的 __BIONIC__ 分支缺少函数声明 |
+            | seedrng | getrandom 需要 API 28,且 Android 的 RNG 由系统管理 |
+            | yescrypt 密码哈希 | explicit_bzero 需要 API 29 (保留 DES + SHA256/512) |
 
             ## 使用方法
 
             ```bash
-            # 举例:推到 Android 设备
+            # 举例: 推到 Android 设备
             adb push busybox-arm64 /data/local/tmp/busybox
             adb shell chmod 755 /data/local/tmp/busybox
             adb shell /data/local/tmp/busybox --install -s /data/local/tmp/bb
@@ -455,6 +483,6 @@ jobs:
 
             下载 `SHA256SUMS` 并执行 `sha256sum -c SHA256SUMS` 验证完整性。
 
-            提示:MIPS 架构 NDK r24+ 已停止支持,本仓库固定使用 r23c 编译。
+            提示: MIPS 架构自 NDK r18 (2018) 起已彻底移除支持,本仓库不再提供 MIPS 构建。
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
